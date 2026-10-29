@@ -190,6 +190,7 @@ async function handleApi(request, env, url) {
     case 'report': return report(env, url);
     case 'customers': return customers(request, env, method, id, url);
     case 'ai': return aiRead(request, env, method, id);
+    case 'assistant': return assistant(request, env, method);
     case 'shipments': return shipments(request, env, method, id, action, user);
     case 'receipts': return receipts(request, env, method, id, user);
     case 'orders': return orders(request, env, method, id, action, user, url);
@@ -929,6 +930,192 @@ async function aiRead(request, env, method, action) {
     throw new HttpError(502, failed);
   }
   return json({ kind, result: cleanAiResult(kind, parsed) });
+}
+
+// ---------- Assistant chat ----------
+// Answers questions from the shop's data and suggests orders, expenses or shipments.
+// It never saves anything: the app shows a card and the user confirms.
+
+const ASSISTANT_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    reply: { type: 'STRING' },
+    action: { type: 'STRING', enum: ['none', 'create_order', 'create_expense', 'shipment_draft'] },
+    order: {
+      type: 'OBJECT',
+      nullable: true,
+      properties: {
+        customer_name: { type: 'STRING' }, phone: { type: 'STRING' }, area: { type: 'STRING' },
+        payment_method: { type: 'STRING', enum: PAYMENT_METHODS },
+        status: { type: 'STRING', enum: ORDER_STATUSES },
+        delivery_cost_usd: { type: 'NUMBER' }, total_usd: { type: 'NUMBER' }, notes: { type: 'STRING' },
+        items: {
+          type: 'ARRAY',
+          items: {
+            type: 'OBJECT',
+            properties: { product_id: { type: 'INTEGER' }, qty: { type: 'INTEGER' }, unit_price_usd: { type: 'NUMBER' } },
+            required: ['product_id', 'qty', 'unit_price_usd'],
+          },
+        },
+      },
+    },
+    expense: { ...AI_SCHEMAS.expense, nullable: true },
+    shipment: { ...AI_SCHEMAS.shipment, nullable: true },
+  },
+  required: ['reply', 'action'],
+};
+
+// A compact text snapshot of the shop for the AI. No customer phone numbers.
+async function shopSnapshot(env) {
+  const month = today().slice(0, 7);
+  const [y, m] = month.split('-').map(Number);
+  const prev = new Date(Date.UTC(y, m - 2, 1)).toISOString().slice(0, 7);
+  const summary = async (mm) => (await dashboard(env, new URL('https://x/?month=' + mm))).json();
+  const [cur, last, settingsRows, prods, recent, exp] = await Promise.all([
+    summary(month),
+    summary(prev),
+    env.DB.prepare('SELECT key, value FROM settings').all(),
+    env.DB.prepare('SELECT id, style, code, color, size, qty, sale_price_usd, min_price_usd, avg_cost_usd FROM products ORDER BY style, color, size').all(),
+    env.DB.prepare(`SELECT o.id, o.date, o.customer_name, o.area, o.status, o.payment_method, o.total_usd, o.delivery_cost_usd,
+        (SELECT GROUP_CONCAT(oi.qty || 'x ' || p.style || ' ' || p.color || ' ' || p.size, ', ') FROM order_items oi JOIN products p ON p.id = oi.product_id WHERE oi.order_id = o.id) AS items
+      FROM orders o ORDER BY o.date DESC, o.id DESC LIMIT 60`).all(),
+    env.DB.prepare('SELECT category, SUM(amount_usd) AS amount FROM expenses WHERE substr(date, 1, 7) = ? GROUP BY category').bind(month).all(),
+  ]);
+  const rate = num(Object.fromEntries(settingsRows.results.map((r) => [r.key, r.value])).lbp_rate, 89500);
+  const firstName = (n) => String(n || '').trim().split(/\s+/)[0] || '(no name)';
+  const sum = (s) => `sales $${s.revenue}, cost of pieces $${s.cost_of_goods}, delivery $${s.delivery}, expenses $${s.expenses}, PROFIT $${s.profit}, ${s.orders} orders, ${s.pieces_sold} pieces; drivers owe $${s.cod_owed.amount} (${s.cod_owed.orders} orders); open orders ${s.open_orders.orders} ($${s.open_orders.amount}); stock ${s.stock.pieces} pcs worth $${s.stock.value} at cost`;
+  return [
+    `Today: ${today()}. Money is in USD. 1 USD = ${rate} LBP.`,
+    `This month (${month}): ${sum(cur)}.`,
+    `Last month (${prev}): ${sum(last)}.`,
+    `Best sellers this month: ${cur.best_sellers.map((b) => `${b.style} ${b.pieces} pcs $${b.sales}`).join('; ') || 'none'}.`,
+    `Expenses this month: ${exp.results.map((e) => `${e.category} $${round2(e.amount)}`).join('; ') || 'none'}.`,
+    'Stock (id | style | code | color | size | qty left | selling price | minimum price | real cost per piece):',
+    ...prods.results.map((p) => `${p.id} | ${p.style} | ${p.code} | ${p.color} | ${p.size} | ${p.qty} | ${p.sale_price_usd} | ${p.min_price_usd} | ${p.avg_cost_usd}`),
+    'Recent orders (id | date | customer first name | area | status | payment | total | delivery fee | items):',
+    ...recent.results.map((o) => `${o.id} | ${o.date} | ${firstName(o.customer_name)} | ${o.area} | ${o.status} | ${o.payment_method} | ${o.total_usd} | ${o.delivery_cost_usd} | ${o.items || ''}`),
+  ].join('\n');
+}
+
+const ASSISTANT_PROMPT = `You are the assistant inside "She Sleepwear", a private app for a small online pajama shop in Lebanon.
+The owner and family use you to ask about their numbers and to add orders, expenses and shipments.
+
+Rules:
+- Reply in the same language the user writes in (English or Arabic). Short, simple, friendly. No markdown tables.
+- Answer only from the shop data below. If something is not in the data, say you don't know. Never invent numbers.
+- Order statuses: new, sent, delivered, paid, returned, cancelled. Only delivered and paid count as sales.
+  For cash on delivery (cod), "delivered" means the driver still owes the money.
+- Profit = sales - real cost of pieces sold - delivery fees - other expenses.
+
+Adding things (you only SUGGEST; the app shows a card and the user confirms):
+- You cannot save anything yourself. Never say "added" or "saved". Say it is ready and they should tap "Confirm & save" on the card below.
+- To add an order: action "create_order" and fill "order". Use product_id values from the stock list only.
+  Match the style, color and size the user says. If the style, color or size is unclear or missing, ask a short question instead (action "none").
+  Use the selling price unless the user gives a price. payment_method: cod (cash on delivery, default), whish, omt, cash.
+  status: "new" unless the user says otherwise. Copy the phone exactly as the user typed it; never invent one.
+  total_usd = sum of qty x unit_price_usd unless the user gives a total. delivery_cost_usd = 0 unless the user says.
+  Warn in the reply if a price is below the minimum price or if stock is not enough.
+- To add an expense: action "create_expense" with "expense" (category: Ads, Packaging, Delivery, Phone / internet, Other).
+- If the user sends a photo of a supplier receipt or the owner's notebook: action "shipment_draft" with "shipment",
+  reading it with these rules:
+${AI_PROMPTS.shipment}
+  In the reply, say briefly what you read (styles and piece counts) and remind them to check crossed-out sizes.
+- If the photo is an expense receipt, use "create_expense" instead.
+- Otherwise action "none".`;
+
+function cleanOrderDraft(o, products) {
+  o = o && typeof o === 'object' ? o : {};
+  const items = (Array.isArray(o.items) ? o.items : [])
+    .map((it) => {
+      const p = products.find((x) => x.id === int(it?.product_id));
+      if (!p) return null;
+      const qty = Math.max(int(it.qty), 1);
+      const price = nonNeg(it.unit_price_usd) || p.sale_price_usd;
+      return {
+        product_id: p.id, qty, unit_price_usd: price,
+        style: p.style, color: p.color, size: p.size, stock: p.qty, min_price_usd: p.min_price_usd, photo_id: p.photo_id, photo_v: p.photo_v,
+      };
+    })
+    .filter(Boolean);
+  const itemsTotal = round2(items.reduce((a, it) => a + it.qty * it.unit_price_usd, 0));
+  return {
+    customer_name: str(o.customer_name, 100), phone: str(o.phone, 30), area: str(o.area, 100),
+    payment_method: PAYMENT_METHODS.includes(o.payment_method) ? o.payment_method : 'cod',
+    status: ORDER_STATUSES.includes(o.status) ? o.status : 'new',
+    delivery_cost_usd: nonNeg(o.delivery_cost_usd),
+    total_usd: nonNeg(o.total_usd) || itemsTotal,
+    notes: str(o.notes, 1000),
+    items,
+  };
+}
+
+async function assistant(request, env, method) {
+  if (method !== 'POST') throw new HttpError(405, 'Method not allowed');
+  if (!env.GEMINI_API_KEY) throw new HttpError(400, 'AI is not set up yet');
+  const form = await request.formData();
+  let history = [];
+  try {
+    history = JSON.parse(form.get('history') || '[]');
+  } catch {
+    throw new HttpError(400, 'Bad request');
+  }
+  const message = str(form.get('message'), 2000);
+  const file = form.get('file');
+  const hasPhoto = file && typeof file !== 'string';
+  if (!message && !hasPhoto) throw new HttpError(400, 'Type a message or add a photo');
+
+  const parts = [{ text: message || 'Please read this photo.' }];
+  if (hasPhoto) {
+    if (!/^image\//.test(file.type)) throw new HttpError(400, 'Only photos are allowed');
+    const data = await file.arrayBuffer();
+    if (data.byteLength > MAX_RECEIPT_BYTES) throw new HttpError(400, 'Photo is too big');
+    parts.push({ inline_data: { mime_type: file.type, data: toBase64(data) } });
+  }
+  // Keep the last few turns so follow-up questions make sense
+  const contents = (Array.isArray(history) ? history : []).slice(-10)
+    .filter((h) => h && (h.role === 'user' || h.role === 'model') && h.text)
+    .map((h) => ({ role: h.role, parts: [{ text: str(h.text, 2000) }] }));
+  contents.push({ role: 'user', parts });
+
+  const snapshot = await shopSnapshot(env);
+  const payload = JSON.stringify({
+    systemInstruction: { parts: [{ text: `${ASSISTANT_PROMPT}\n\nSHOP DATA:\n${snapshot}` }] },
+    contents,
+    generationConfig: { responseMimeType: 'application/json', responseSchema: ASSISTANT_SCHEMA, temperature: 0.2 },
+  });
+  const ask = (model) => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
+    body: payload,
+  });
+  let res = await ask(env.GEMINI_MODEL || 'gemini-3-flash-preview');
+  if (res.status === 404) res = await ask('gemini-2.5-flash');
+  if (res.status === 429) throw new HttpError(429, 'The free AI limit is reached for now. Try again later.');
+  const failed = 'The assistant could not answer. Try again in a moment.';
+  if (!res.ok) throw new HttpError(502, failed);
+  let r;
+  try {
+    const out = await res.json();
+    r = JSON.parse(out.candidates[0].content.parts[0].text);
+  } catch {
+    throw new HttpError(502, failed);
+  }
+
+  const out = { reply: str(r.reply, 4000) || '…', action: 'none' };
+  if (r.action === 'create_order') {
+    const { results: products } = await env.DB.prepare(
+      'SELECT p.id, p.style, p.color, p.size, p.qty, p.sale_price_usd, p.min_price_usd, sp.id AS photo_id, sp.updated_at AS photo_v FROM products p LEFT JOIN style_photos sp ON sp.style = p.style'
+    ).all();
+    const order = cleanOrderDraft(r.order, products);
+    if (order.items.length) Object.assign(out, { action: 'create_order', order });
+  } else if (r.action === 'create_expense' && r.expense) {
+    const expense = cleanAiResult('expense', r.expense);
+    if (expense.amount > 0) Object.assign(out, { action: 'create_expense', expense });
+  } else if (r.action === 'shipment_draft' && r.shipment) {
+    const shipment = cleanAiResult('shipment', r.shipment);
+    if (shipment.items.length) Object.assign(out, { action: 'shipment_draft', shipment });
+  }
+  return json(out);
 }
 
 // ---------- Expenses ----------
