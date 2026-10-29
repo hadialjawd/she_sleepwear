@@ -1,0 +1,19 @@
+{
+  // Cloudflare settings. Everything here is on the free plan.
+  "name": "she-sleepwear",
+  "main": "src/index.js",
+  "compatibility_date": "2025-09-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*", "/icon-192.png", "/icon-512.png"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "she-sleepwear",
+      // Replace with the id from: npx wrangler d1 create she-sleepwear
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ]
+}

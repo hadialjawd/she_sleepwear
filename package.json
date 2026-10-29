@@ -1,0 +1,16 @@
+{
+  "name": "she-sleepwear",
+  "version": "1.0.0",
+  "description": "Track stock, shipments, orders and profit for an online pajama shop",
+  "scripts": {
+    "dev": "wrangler dev",
+    "db:init:local": "wrangler d1 execute she-sleepwear --local --file=schema.sql",
+    "db:init": "wrangler d1 execute she-sleepwear --remote --file=schema.sql",
+    "deploy": "wrangler deploy"
+  },
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "wrangler": "^4.155.0"
+  },
+  "private": true
+}
