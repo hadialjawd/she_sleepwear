@@ -280,6 +280,7 @@ const routes = [
   [/^#\/expenses\/new$/, pageExpenseNew],
   [/^#\/report$/, pageReport],
   [/^#\/settings$/, pageSettings],
+  [/^#\/assistant$/, pageAssistant],
 ];
 const MORE_TABS = ['shipments', 'expenses', 'settings', 'report', 'more'];
 
@@ -317,6 +318,7 @@ function openAddSheet() {
   const s = openSheet(`
     <h2>Add new</h2>
     <div class="sheet-menu">
+      ${state.settings.ai_enabled ? '<a href="#/assistant"><span class="em">✨</span><span>Ask the assistant<small>Questions, or add an order by message or photo</small></span></a>' : ''}
       <a href="#/orders/new"><span class="em">🛍️</span><span>New order<small>A customer bought something</small></span></a>
       <a href="#/shipments/new"><span class="em">📦</span><span>New shipment<small>Stock from Turkey${state.settings.ai_enabled ? ' · scan your notebook or receipt with AI' : ''}</small></span></a>
       <a href="#/expenses/new"><span class="em">🧾</span><span>New expense<small>Ads, packaging, other costs</small></span></a>
@@ -400,6 +402,7 @@ async function pageHome() {
 
   view.innerHTML = `
     <div class="greet"><span>${esc(greeting())} 🌙</span><input type="month" id="month" value="${esc(month)}" aria-label="Month"></div>
+    ${state.settings.ai_enabled ? '<a class="btn soft block" href="#/assistant" style="margin-bottom:14px">✨ Ask anything about your shop</a>' : ''}
     <div class="card stat hero">
       <div class="label">Profit · ${esc(monthName(d.month))}</div>
       <div class="value num">${usd(d.profit)}</div>
@@ -547,7 +550,9 @@ async function pageOrderForm(id) {
   if (leftPage(here)) return;
   setTop(id ? `Order #${id}` : 'New order', '', '#/orders');
   const fee = state.settings.default_delivery_fee || '';
-  const o = order || { date: today(), payment_method: 'cod', status: 'new', items: [], total_usd: '', delivery_cost_usd: fee };
+  const draft = !id && window._draftOrder;
+  window._draftOrder = null;
+  const o = order || (draft ? { date: today(), ...draft } : { date: today(), payment_method: 'cod', status: 'new', items: [], total_usd: '', delivery_cost_usd: fee });
 
   if (!products.length) {
     view.innerHTML = `<div class="empty"><span class="big">📦</span>You have no stock yet.<br><br><a class="btn primary" href="#/shipments/new">Add a shipment</a> <a class="btn" href="#/stock/new">Add stock</a></div>`;
@@ -616,7 +621,7 @@ async function pageOrderForm(id) {
     </form>`;
 
   const f = $('#f');
-  let totalTouched = !!id;
+  let totalTouched = !!id || !!draft;
   const costOf = (pid) => {
     const prev = o.items.find((x) => x.product_id === pid);
     return prev ? prev.unit_cost_usd : products.find((p) => p.id === pid)?.avg_cost_usd || 0;
@@ -1035,6 +1040,8 @@ async function pageShipmentForm(id) {
   setTop(id ? 'Edit shipment' : 'New shipment', '', id ? '#/shipments/' + id : '#/shipments');
   const sh = s || { date: today(), supplier: '', items: [], shipping_usd: '', customs_usd: '', other_usd: '', notes: '' };
   const scanned = []; // photos read by AI, saved as receipts with the shipment
+  const draft = !id && window._draftShipment;
+  window._draftShipment = null;
 
   const itemRow = (it = {}, ai = false) => `
     <div class="item-row ${ai ? 'ai' : ''}">
@@ -1131,15 +1138,8 @@ async function pageShipmentForm(id) {
     refresh();
   });
 
-  $('#aiBtn')?.addEventListener('click', busy($('#aiBtn'), async () => {
-    const file = await pickPhoto();
-    if (!file) return;
-    const btn = $('#aiBtn');
-    btn.innerHTML = '<span class="spinner"></span> Reading the photo…';
-    try {
-      const r = await aiRead(file, 'shipment');
-      scanned.push(file);
-      if (!r.items.length) throw new Error('The AI found no items. Try a clearer photo, or type them in.');
+  // Puts what the AI read into the form (pink lines), adding to what is already there
+  const fillFromAi = (r) => {
       // If the form only has one empty row, replace it; otherwise add after what's there
       const rows = $$('.item-row', f);
       if (rows.length === 1 && !$('[name=style]', rows[0]).value) rows[0].remove();
@@ -1159,12 +1159,29 @@ async function pageShipmentForm(id) {
       if (r.notes) f.notes.value = [f.notes.value, r.notes].filter(Boolean).join('\n');
       const pieces = r.items.reduce((a, it) => a + it.qty, 0);
       const odd = r.currency && !['USD', 'LBP'].includes(r.currency);
-      $('#aiNote').innerHTML = `<div class="note ${odd ? '' : 'info'}">Filled ${r.items.length} line${r.items.length === 1 ? '' : 's'} (${pieces} pieces). Pink lines came from the AI, so <b>check each one</b>.${odd ? ` Prices look like <b>${esc(r.currency)}</b>; change them to USD before saving.` : ''}</div>`;
+      const note = `<div class="note ${odd ? '' : 'info'}">Filled ${r.items.length} line${r.items.length === 1 ? '' : 's'} (${pieces} pieces). Pink lines came from the AI, so <b>check each one</b>, especially crossed-out sizes.${odd ? ` Prices look like <b>${esc(r.currency)}</b>; change them to USD before saving.` : ''}</div>`;
+      if ($('#aiNote')) $('#aiNote').innerHTML = note;
+      else $('#f').insertAdjacentHTML('beforebegin', note);
       refresh();
+  };
+  $('#aiBtn')?.addEventListener('click', busy($('#aiBtn'), async () => {
+    const file = await pickPhoto();
+    if (!file) return;
+    const btn = $('#aiBtn');
+    btn.innerHTML = '<span class="spinner"></span> Reading the photo…';
+    try {
+      const r = await aiRead(file, 'shipment');
+      scanned.push(file);
+      if (!r.items.length) throw new Error('The AI found no items. Try a clearer photo, or type them in.');
+      fillFromAi(r);
     } finally {
       btn.textContent = 'Scan another photo';
     }
   }));
+  if (draft) {
+    if (draft.photo) scanned.push(draft.photo);
+    fillFromAi(draft.result);
+  }
 
   f.addEventListener('submit', busy($('#save'), async () => {
     const items = readItems();
@@ -1319,6 +1336,18 @@ async function pageExpenseNew() {
   const scanned = [];
   wireSegs(f);
   onMoneyCurrencyChange(f);
+  const fillExpense = (r) => {
+    if (r.date) f.date.value = r.date;
+    if (EXPENSE_CATS.includes(r.category)) setSeg(f, 'category', r.category);
+    if (r.amount) setMoney(f, 'amount', r.amount, r.currency === 'LBP' ? 'LBP' : 'USD');
+    if (r.note) f.note.value = r.note;
+  };
+  const draft = window._draftExpense;
+  window._draftExpense = null;
+  if (draft) {
+    if (draft.photo) scanned.push(draft.photo);
+    fillExpense(draft.result);
+  }
   $('#aiBtn')?.addEventListener('click', busy($('#aiBtn'), async () => {
     const file = await pickPhoto();
     if (!file) return;
@@ -1327,10 +1356,7 @@ async function pageExpenseNew() {
     try {
       const r = await aiRead(file, 'expense');
       scanned.push(file);
-      if (r.date) f.date.value = r.date;
-      if (EXPENSE_CATS.includes(r.category)) setSeg(f, 'category', r.category);
-      if (r.amount) setMoney(f, 'amount', r.amount, r.currency === 'LBP' ? 'LBP' : 'USD');
-      if (r.note) f.note.value = r.note;
+      fillExpense(r);
       const odd = r.currency && !['USD', 'LBP'].includes(r.currency);
       $('#aiNote').innerHTML = `<div class="note ${odd ? '' : 'info'}">Filled from the photo. Please check it.${odd ? ` The amount looks like <b>${esc(r.currency)}</b>; change it to USD.` : ''}</div>`;
     } finally {
@@ -1424,6 +1450,232 @@ async function pageReport() {
 
   $('#month').addEventListener('change', (e) => (location.hash = '#/report?m=' + (e.target.value || thisMonth())));
   $('#print').addEventListener('click', () => window.print());
+}
+
+// ---------- Assistant chat ----------
+
+// Chat history lives in memory (and the browser tab), never on the server.
+const chat = (() => {
+  try {
+    return JSON.parse(sessionStorage.getItem('chat') || '[]');
+  } catch {
+    return [];
+  }
+})();
+const chatPhotos = new Map(); // message index -> photo File (photos are not kept after a refresh)
+const saveChat = () => {
+  try {
+    sessionStorage.setItem('chat', JSON.stringify(chat.slice(-40)));
+  } catch { /* storage may be blocked */ }
+};
+
+const SUGGESTIONS = [
+  'How much profit did I make this month?',
+  'Which sizes and colors sell best?',
+  'Who still owes me money?',
+  'What is sold out?',
+];
+
+function orderCard(m, i) {
+  const o = m.order;
+  const warn = o.items.filter((it) => it.qty > it.stock || (it.min_price_usd && it.unit_price_usd < it.min_price_usd));
+  return `
+    <div class="card chat-card">
+      <div class="row between"><b>🛍️ New order</b><span class="pill ${o.status}">${STATUS[o.status]}</span></div>
+      <div class="small muted" style="margin-top:4px">${esc(o.customer_name || 'No name')}${o.area ? ' · ' + esc(o.area) : ''}${o.phone ? ' · ' + esc(o.phone) : ''} · ${esc(PAY[o.payment_method])}</div>
+      ${o.items.map((it) => `<div class="row" style="padding:6px 0">${photoTag(it, 'sm')}<div class="grow small"><b>${it.qty}×</b> ${esc([it.style, it.color, it.size].filter(Boolean).join(' · '))}</div><span class="num small">${usd(it.unit_price_usd)}</span></div>`).join('')}
+      <div class="row between bold" style="border-top:1px solid var(--line);padding-top:8px;margin-top:4px"><span>Total</span><span class="num">${usd(o.total_usd)}</span></div>
+      ${o.delivery_cost_usd ? `<div class="row between small muted"><span>Delivery fee you pay</span><span class="num">${usd(o.delivery_cost_usd)}</span></div>` : ''}
+      ${warn.length ? `<div class="note">Check: ${warn.map((it) => esc(`${it.style} ${it.color} ${it.size}`) + (it.qty > it.stock ? ` (only ${it.stock} left)` : ' (below minimum price)')).join(', ')}</div>` : ''}
+      ${m.saved ? `<div class="note info">Saved as order #${m.saved}. <a href="#/orders/${m.saved}">Open it</a>${waPhone(o.phone) ? ` · <a href="#" data-chat-wa="${i}">Send WhatsApp</a>` : ''}</div>` : `
+      <div class="actions" style="margin-top:12px"><button class="primary small" data-chat-save="${i}">Confirm & save</button><button class="small" data-chat-edit="${i}">Edit first</button></div>`}
+    </div>`;
+}
+
+function expenseCard(m, i) {
+  const e = m.expense;
+  return `
+    <div class="card chat-card">
+      <b>🧾 New expense</b>
+      <div class="row between" style="margin-top:6px"><span>${esc(e.category)}${e.note ? ' · ' + esc(e.note) : ''}</span><b class="num">${e.currency === 'LBP' ? Math.round(e.amount).toLocaleString('en-US') + ' LBP' : usd(e.amount)}</b></div>
+      ${e.date ? `<div class="small muted">${fmtDate(e.date)}</div>` : ''}
+      ${!['USD', 'LBP'].includes(e.currency) ? `<div class="note">Amount looks like ${esc(e.currency)}. Use Edit first to change it to USD.</div>` : ''}
+      ${m.saved ? '<div class="note info">Saved. <a href="#/expenses">See expenses</a></div>' : `
+      <div class="actions" style="margin-top:12px"><button class="primary small" data-chat-save="${i}">Confirm & save</button><button class="small" data-chat-edit="${i}">Edit first</button></div>`}
+    </div>`;
+}
+
+function shipmentCard(m, i) {
+  const s = m.shipment;
+  const styles = {};
+  s.items.forEach((it) => (styles[it.style] = (styles[it.style] || 0) + it.qty));
+  const pieces = s.items.reduce((a, it) => a + it.qty, 0);
+  return `
+    <div class="card chat-card">
+      <b>📦 Shipment from photo</b>
+      <div class="small muted" style="margin-top:4px">${s.items.length} lines · ${pieces} pieces${s.shipping ? ` · shipping ${usd(s.shipping)}` : ''}</div>
+      ${Object.entries(styles).map(([st, n]) => `<div class="row between small" style="padding:3px 0"><span>${esc(st)}</span><span class="num">${n} pcs</span></div>`).join('')}
+      <div class="actions" style="margin-top:12px"><button class="primary small" data-chat-edit="${i}">Review in shipment form</button></div>
+    </div>`;
+}
+
+function chatHtml() {
+  if (!chat.length) {
+    return `
+      <div class="empty" style="padding:24px 8px 8px"><span class="big">✨</span>Ask about your shop, or add an order by message.<br>
+        <span class="small">Example: <i>“Rana, Jounieh, 71 123 456, 2 Smile teal M, cash on delivery”</i></span></div>
+      <div class="chips" style="flex-wrap:wrap;justify-content:center">${SUGGESTIONS.map((s) => `<button data-suggest="${esc(s)}">${esc(s)}</button>`).join('')}</div>`;
+  }
+  return chat.map((m, i) => {
+    if (m.role === 'user') {
+      return `<div class="bubble me">${m.photo ? '<div class="small" style="opacity:.85">📷 Photo</div>' : ''}${esc(m.text)}</div>`;
+    }
+    const card = m.action === 'create_order' ? orderCard(m, i) : m.action === 'create_expense' ? expenseCard(m, i) : m.action === 'shipment_draft' ? shipmentCard(m, i) : '';
+    return `<div class="bubble ai ${m.error ? 'err' : ''}">${esc(m.text)}</div>${card}`;
+  }).join('');
+}
+
+async function pageAssistant() {
+  setTop('Assistant', chat.length ? '<button class="small" id="clearChat">New chat</button>' : '', '#/');
+  if (!state.settings.ai_enabled) {
+    view.innerHTML = '<div class="empty"><span class="big">✨</span>The assistant needs AI to be set up first.</div>';
+    return;
+  }
+  await loadProducts();
+  view.innerHTML = `
+    <div id="chatLog" class="chat-log">${chatHtml()}</div>
+    <form id="chatF" class="composer">
+      <div id="chatPhoto" class="small" hidden></div>
+      <div class="row">
+        <button type="button" class="icon-btn" id="chatCam" aria-label="Add a photo">📷</button>
+        <textarea id="chatMsg" rows="1" placeholder="Ask or add an order…"></textarea>
+        <button class="primary icon-btn" id="chatSend" aria-label="Send">➤</button>
+      </div>
+      <div class="tiny muted center" style="margin-top:6px">AI can make mistakes. Check before you confirm.</div>
+    </form>`;
+  const log = $('#chatLog');
+  const f = $('#chatF');
+  const msg = $('#chatMsg');
+  let photo = null;
+  const scrollDown = () => window.scrollTo(0, document.body.scrollHeight);
+  const redraw = () => {
+    log.innerHTML = chatHtml();
+    wireLog();
+    scrollDown();
+  };
+  const setPhoto = (file) => {
+    photo = file;
+    $('#chatPhoto').hidden = !file;
+    $('#chatPhoto').innerHTML = file ? `📷 Photo added <button type="button" class="link small" id="chatPhotoX">Remove</button>` : '';
+    $('#chatPhotoX')?.addEventListener('click', () => setPhoto(null));
+  };
+
+  const send = async (text) => {
+    text = text.trim();
+    if (!text && !photo) return;
+    const history = chat.filter((m) => !m.error).slice(-10).map((m) => ({ role: m.role, text: m.text }));
+    const userMsg = { role: 'user', text: text || 'Please read this photo.', photo: !!photo };
+    chat.push(userMsg);
+    const sentPhoto = photo;
+    if (sentPhoto) chatPhotos.set(chat.length - 1, sentPhoto);
+    msg.value = '';
+    setPhoto(null);
+    redraw();
+    log.insertAdjacentHTML('beforeend', '<div class="bubble ai" id="typing"><span class="spinner"></span></div>');
+    scrollDown();
+    $('#chatSend').disabled = true;
+    try {
+      const fd = new FormData();
+      fd.append('message', text);
+      fd.append('history', JSON.stringify(history));
+      if (sentPhoto) fd.append('file', await shrinkImage(sentPhoto), 'photo.jpg');
+      const r = await api('assistant', { method: 'POST', form: fd });
+      const m = { role: 'model', text: r.reply, action: r.action };
+      if (r.order) m.order = r.order;
+      if (r.expense) m.expense = r.expense;
+      if (r.shipment) m.shipment = r.shipment;
+      chat.push(m);
+      if (sentPhoto && r.action !== 'none') chatPhotos.set(chat.length - 1, sentPhoto);
+    } catch (err) {
+      chat.push({ role: 'model', text: err.message, error: true });
+    } finally {
+      $('#chatSend').disabled = false;
+    }
+    saveChat();
+    if (location.hash === '#/assistant') redraw();
+  };
+
+  function wireLog() {
+    $$('[data-suggest]', log).forEach((b) => b.addEventListener('click', () => send(b.dataset.suggest)));
+    $$('[data-chat-save]', log).forEach((b) => b.addEventListener('click', busy(b, async () => {
+      const i = Number(b.dataset.chatSave);
+      const m = chat[i];
+      if (m.action === 'create_order') {
+        const o = m.order;
+        const saved = await api('orders', {
+          method: 'POST',
+          body: { ...o, date: today(), items: o.items.map((it) => ({ product_id: it.product_id, qty: it.qty, unit_price_usd: it.unit_price_usd })) },
+        });
+        m.saved = saved.id;
+        toast('Order saved');
+      } else if (m.action === 'create_expense') {
+        const e = m.expense;
+        const saved = await api('expenses', {
+          method: 'POST',
+          body: { date: e.date || today(), category: e.category, amount_usd: round2(toUsd(e.amount, e.currency === 'LBP' ? 'LBP' : 'USD')), note: e.note },
+        });
+        const p = chatPhotos.get(i);
+        if (p) await uploadReceipts([p], { type: 'expense', id: saved.id });
+        m.saved = saved.id;
+        toast('Expense saved');
+      }
+      saveChat();
+      redraw();
+    })));
+    $$('[data-chat-edit]', log).forEach((b) => b.addEventListener('click', () => {
+      const i = Number(b.dataset.chatEdit);
+      const m = chat[i];
+      if (m.action === 'create_order') {
+        window._draftOrder = { ...m.order };
+        location.hash = '#/orders/new';
+      } else if (m.action === 'create_expense') {
+        window._draftExpense = { result: m.expense, photo: chatPhotos.get(i) };
+        location.hash = '#/expenses/new';
+      } else if (m.action === 'shipment_draft') {
+        window._draftShipment = { result: m.shipment, photo: chatPhotos.get(i) };
+        location.hash = '#/shipments/new';
+      }
+    }));
+    $$('[data-chat-wa]', log).forEach((a) => a.addEventListener('click', (e) => {
+      e.preventDefault();
+      const m = chat[Number(a.dataset.chatWa)];
+      openWhatsApp({ ...m.order, total_usd: m.order.total_usd });
+    }));
+  }
+
+  $('#chatCam').addEventListener('click', async () => setPhoto(await pickPhoto()));
+  f.addEventListener('submit', (e) => {
+    e.preventDefault();
+    send(msg.value);
+  });
+  msg.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      send(msg.value);
+    }
+  });
+  msg.addEventListener('input', () => {
+    msg.style.height = 'auto';
+    msg.style.height = Math.min(msg.scrollHeight, 140) + 'px';
+  });
+  $('#clearChat')?.addEventListener('click', () => {
+    chat.length = 0;
+    chatPhotos.clear();
+    saveChat();
+    pageAssistant();
+  });
+  wireLog();
+  scrollDown();
 }
 
 // ---------- Settings ----------
