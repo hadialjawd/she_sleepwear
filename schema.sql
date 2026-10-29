@@ -25,6 +25,15 @@ CREATE TABLE IF NOT EXISTS settings (
   value TEXT NOT NULL
 );
 INSERT OR IGNORE INTO settings (key, value) VALUES ('lbp_rate', '89500');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('default_delivery_fee', '0');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('wa_confirm', 'Hi {name}! Thank you for your order from She Sleepwear 🌙
+{items}
+Total: {total}
+Delivery to: {area}
+We''ll let you know when it''s on the way.');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('wa_sent', 'Hi {name}! Your She Sleepwear order is on the way 🚚
+Total to pay: {total}
+Thank you!');
 
 -- One row per style + size + color
 CREATE TABLE IF NOT EXISTS products (
@@ -36,7 +45,29 @@ CREATE TABLE IF NOT EXISTS products (
   qty INTEGER NOT NULL DEFAULT 0,
   avg_cost_usd REAL NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  code TEXT NOT NULL DEFAULT '',
+  min_price_usd REAL NOT NULL DEFAULT 0,
   UNIQUE (style, size, color)
+);
+
+-- Saved customers. Phone is stored normalized (digits, with 961), one customer per phone.
+CREATE TABLE IF NOT EXISTS customers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL DEFAULT '',
+  phone TEXT NOT NULL DEFAULT '',
+  area TEXT NOT NULL DEFAULT '',
+  notes TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_customers_phone ON customers(phone) WHERE phone != '';
+
+-- One photo per style (shown in stock and when picking items)
+CREATE TABLE IF NOT EXISTS style_photos (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  style TEXT NOT NULL UNIQUE,
+  mime TEXT NOT NULL,
+  data BLOB NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- A shipment from Turkey. Status: 'on_the_way' or 'arrived'.
@@ -77,7 +108,8 @@ CREATE TABLE IF NOT EXISTS orders (
   delivery_cost_usd REAL NOT NULL DEFAULT 0,
   notes TEXT NOT NULL DEFAULT '',
   created_by INTEGER REFERENCES users(id),
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  customer_id INTEGER REFERENCES customers(id)
 );
 
 CREATE TABLE IF NOT EXISTS order_items (
@@ -111,6 +143,7 @@ CREATE TABLE IF NOT EXISTS receipts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_orders_date ON orders(date);
+CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id);
 CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id);
 CREATE INDEX IF NOT EXISTS idx_shipment_items_shipment ON shipment_items(shipment_id);
 CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);

@@ -67,7 +67,18 @@ Files in `migrations/` change an existing database. Run each new one once:
 
 ```bash
 npx wrangler d1 execute she-sleepwear --remote --file=migrations/0002_google_login.sql
+npx wrangler d1 execute she-sleepwear --remote --file=migrations/0003_redesign.sql
 ```
+
+## AI reading (free)
+
+Receipts and notebook pages can be read by Google Gemini (free tier). Create a key at [Google AI Studio](https://aistudio.google.com/apikey), then:
+
+```bash
+npx wrangler secret put GEMINI_API_KEY
+```
+
+Optional: set `GEMINI_MODEL` to pick another model (default `gemini-3-flash-preview`, falls back to `gemini-2.5-flash`).
 
 ## Free plan limits
 

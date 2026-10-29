@@ -1,7 +1,7 @@
 // Draws the PNG app icons in code (same shape as public/icon.svg),
 // so the repo has no image files. Phones that can't use SVG icons use these.
 
-const BRAND = [0xb8, 0x5c, 0x7a];
+const BRAND = [0xa8, 0x47, 0x6a];
 const SHIRT = [[176, 120], [336, 120], [408, 184], [364, 236], [336, 214], [336, 392], [176, 392], [176, 214], [148, 236], [104, 184]];
 const BUTTONS = [[256, 250], [256, 290], [256, 330]];
 
