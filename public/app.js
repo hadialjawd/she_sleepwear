@@ -206,7 +206,18 @@ async function router() {
   view.innerHTML = '<div class="empty">Page not found. <a href="#/">Go home</a></div>';
 }
 
-// ---------- Login / first setup ----------
+// ---------- Login (Google) ----------
+
+function loadGoogleScript() {
+  if (window.google?.accounts?.id) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://accounts.google.com/gsi/client';
+    s.onload = resolve;
+    s.onerror = () => reject(new Error('Could not load Google sign-in. Check your internet.'));
+    document.head.appendChild(s);
+  });
+}
 
 async function pageLogin() {
   const me = await api('me');
@@ -215,26 +226,39 @@ async function pageLogin() {
     location.hash = '#/';
     return;
   }
-  const setup = me.needsSetup;
   view.innerHTML = `
     <div class="auth">
       <img class="logo" src="/icon.svg" alt="">
       <h1 class="center">She Sleepwear</h1>
-      <p class="muted center">${setup ? 'Welcome! Create your account to start.' : 'Log in to continue.'}</p>
-      <form class="card" id="f">
-        <label for="u">Username</label>
-        <input id="u" name="username" autocomplete="username" autocapitalize="none" required>
-        <label for="p">Password ${setup ? '(8+ characters)' : ''}</label>
-        <input id="p" name="password" type="password" autocomplete="${setup ? 'new-password' : 'current-password'}" required>
-        <div class="actions"><button class="primary block" id="go">${setup ? 'Create account' : 'Log in'}</button></div>
-      </form>
+      <p class="muted center">Sign in with your Google account.</p>
+      <div class="card center">
+        <div id="gbtn" style="display:flex;justify-content:center;min-height:44px"></div>
+        <p class="small muted" style="margin:12px 0 0">Only people the owner added can get in.</p>
+        <div id="loginErr" class="note" hidden></div>
+      </div>
     </div>`;
-  const f = $('#f');
-  f.addEventListener('submit', busy($('#go'), async () => {
-    await api(setup ? 'setup' : 'login', { method: 'POST', body: { username: f.username.value, password: f.password.value } });
-    await boot();
-    location.hash = '#/';
-  }));
+  const showErr = (msg) => {
+    $('#loginErr').textContent = msg;
+    $('#loginErr').hidden = false;
+  };
+  if (!me.googleClientId) {
+    showErr('Google sign-in is not set up yet.');
+    return;
+  }
+  await loadGoogleScript();
+  google.accounts.id.initialize({
+    client_id: me.googleClientId,
+    callback: async ({ credential }) => {
+      try {
+        await api('login', { method: 'POST', body: { credential } });
+        await boot();
+        location.hash = '#/';
+      } catch (err) {
+        showErr(err.message);
+      }
+    },
+  });
+  google.accounts.id.renderButton($('#gbtn'), { theme: 'outline', size: 'large', shape: 'pill', text: 'signin_with', width: 260 });
 }
 
 // ---------- Home / dashboard ----------
@@ -859,9 +883,9 @@ async function pageMore() {
   view.innerHTML = `
     <div class="card menu">
       <a href="#/expenses"><span>Expenses <span class="muted small">(ads, packaging…)</span></span><span>›</span></a>
-      <a href="#/settings"><span>Settings, users & export</span><span>›</span></a>
+      <a href="#/settings"><span>Settings, people & export</span><span>›</span></a>
     </div>
-    <p class="small muted center" style="margin-top:20px">Logged in as <strong>${esc(state.user.username)}</strong></p>`;
+    <p class="small muted center" style="margin-top:20px">Signed in as <strong>${esc(state.user.email)}</strong>${state.user.role === 'owner' ? ' (owner)' : ''}</p>`;
 }
 
 async function pageExpenses() {
@@ -925,6 +949,7 @@ async function pageExpenseNew() {
 async function pageSettings() {
   setTop('Settings');
   const users = await api('users');
+  const isOwner = state.user.role === 'owner';
   view.innerHTML = `
     <h2 style="margin-top:4px">Dollar rate</h2>
     <form id="rateF" class="card">
@@ -933,24 +958,27 @@ async function pageSettings() {
       <div class="actions"><button class="primary" id="saveRate">Save rate</button></div>
     </form>
 
-    <h2>People who can log in</h2>
+    <h2>Who can get in</h2>
     <div class="card">
-      ${users.map((u) => `<div class="row between" style="padding:4px 0"><span>${esc(u.username)}</span>${u.id === state.user.id ? '<span class="pill">you</span>' : ''}</div>`).join('')}
+      ${users.map((u) => `
+        <div class="row" style="padding:6px 0">
+          <div class="grow">
+            <div class="ellipsis"><strong>${esc(u.name || u.email)}</strong> ${u.role === 'owner' ? '<span class="pill">owner</span>' : ''} ${u.id === state.user.id ? '<span class="pill">you</span>' : ''}</div>
+            <div class="small muted ellipsis">${esc(u.email)} · ${u.last_login ? 'last in ' + fmtDate(u.last_login.slice(0, 10)) : 'not signed in yet'}</div>
+          </div>
+          ${isOwner && u.role !== 'owner' ? `<button class="small danger" data-remove-user="${u.id}" data-email="${esc(u.email)}">Remove</button>` : ''}
+        </div>`).join('')}
+      ${isOwner ? `
       <form id="userF" style="margin-top:6px">
         <div class="fields">
-          <div><label for="nu">New username</label><input id="nu" name="username" autocapitalize="none" autocomplete="off"></div>
-          <div><label for="np">Password (8+)</label><input id="np" name="password" type="password" autocomplete="new-password"></div>
+          <div class="full"><label for="ne">Google email to allow</label><input id="ne" name="email" type="email" autocapitalize="none" autocomplete="off" placeholder="name@gmail.com" required></div>
+          <div class="full"><label for="nn">Name (optional)</label><input id="nn" name="name"></div>
         </div>
-        <div class="actions"><button id="addUser">Add person</button></div>
+        <div class="actions"><button id="addUser">Allow this person</button></div>
       </form>
+      <p class="small muted" style="margin-bottom:0">Removing someone signs them out right away.</p>`
+      : '<p class="small muted" style="margin-bottom:0">Only the owner can add or remove people.</p>'}
     </div>
-
-    <h2>Change my password</h2>
-    <form id="pwF" class="card">
-      <label for="cur">Current password</label><input id="cur" name="current" type="password" autocomplete="current-password">
-      <label for="new">New password (8+)</label><input id="new" name="password" type="password" autocomplete="new-password">
-      <div class="actions"><button id="savePw">Change password</button></div>
-    </form>
 
     <h2>Download your data (Excel)</h2>
     <div class="card">
@@ -977,20 +1005,23 @@ async function pageSettings() {
     state.rate = s.lbp_rate;
     toast('Rate saved');
   }));
-  const uf = $('#userF');
-  uf.addEventListener('submit', busy($('#addUser'), async () => {
-    await api('users', { method: 'POST', body: { username: uf.username.value, password: uf.password.value } });
-    toast('Person added');
-    pageSettings();
-  }));
-  const pf = $('#pwF');
-  pf.addEventListener('submit', busy($('#savePw'), async () => {
-    await api('password', { method: 'POST', body: { current: pf.current.value, password: pf.password.value } });
-    pf.reset();
-    toast('Password changed');
-  }));
+  if (isOwner) {
+    const uf = $('#userF');
+    uf.addEventListener('submit', busy($('#addUser'), async () => {
+      await api('users', { method: 'POST', body: { email: uf.email.value, name: uf.name.value } });
+      toast('Person allowed');
+      pageSettings();
+    }));
+    $$('[data-remove-user]').forEach((b) => b.addEventListener('click', busy(b, async () => {
+      if (!confirm(`Remove ${b.dataset.email}? They will be signed out and can't get in anymore.`)) return;
+      await api('users/' + b.dataset.removeUser, { method: 'DELETE' });
+      toast('Removed');
+      pageSettings();
+    })));
+  }
   $('#logout').addEventListener('click', busy($('#logout'), async () => {
     await api('logout', { method: 'POST' });
+    window.google?.accounts?.id?.disableAutoSelect();
     state.user = null;
     location.hash = '#/login';
   }));
