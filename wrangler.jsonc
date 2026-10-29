@@ -12,8 +12,8 @@
     {
       "binding": "DB",
       "database_name": "she-sleepwear",
-      // Replace with the id from: npx wrangler d1 create she-sleepwear
-      "database_id": "00000000-0000-0000-0000-000000000000"
+      // Created with: npx wrangler d1 create she-sleepwear --location eeur
+      "database_id": "fc5c247c-075d-4816-a4e5-524d5c13e96b"
     }
   ]
 }
