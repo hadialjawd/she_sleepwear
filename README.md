@@ -38,7 +38,7 @@ Copy the `database_id` it prints into `wrangler.jsonc`.
 
 Set up Google sign-in (free):
 1. In [Google Cloud Console](https://console.cloud.google.com), create a project, then **Google Auth Platform → Get started** (Audience: External).
-2. **Clients → Create client → Web application**. Add your app link (`https://she-sleepwear.<your-name>.workers.dev`) under **Authorized JavaScript origins**.
+2. **Clients → Create client → Web application**. Add your app link (`https://dashboard.<your-subdomain>.workers.dev`) under **Authorized JavaScript origins**.
 3. **Audience → Publish app**.
 4. Put the **Client ID** in `GOOGLE_CLIENT_ID` and your Google email in `OWNER_EMAIL` in `wrangler.jsonc`. The client secret is not needed.
 

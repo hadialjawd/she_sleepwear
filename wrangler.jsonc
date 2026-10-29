@@ -1,6 +1,6 @@
 {
   // Cloudflare settings. Everything here is on the free plan.
-  "name": "she-sleepwear",
+  "name": "dashboard",
   "main": "src/index.js",
   "compatibility_date": "2025-09-01",
   "vars": {
