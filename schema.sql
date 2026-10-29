@@ -1,11 +1,16 @@
 -- She Sleepwear database (Cloudflare D1 / SQLite)
 -- All money is stored in USD. LBP is converted using the rate in settings.
 
+-- Allow list: only these Google accounts can sign in.
+-- The owner (OWNER_EMAIL in wrangler.jsonc) is added on first sign-in.
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  username TEXT NOT NULL UNIQUE,
-  pass_hash TEXT NOT NULL,
-  salt TEXT NOT NULL,
+  email TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL DEFAULT '',
+  picture TEXT NOT NULL DEFAULT '',
+  role TEXT NOT NULL DEFAULT 'member',
+  added_by INTEGER,
+  last_login TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

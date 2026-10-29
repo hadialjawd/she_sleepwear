@@ -13,7 +13,7 @@ Works on phone and computer. Runs free on Cloudflare (no credit card).
 - **Expenses**: ads, packaging and other costs, with receipt photos.
 - **Receipts**: photos are shrunk and saved with the shipment or expense.
 - **USD and LBP**: every money field can be typed in USD or LBP. Everything is saved in USD using the rate in Settings.
-- **Two or more people** can log in. **Export** to Excel (CSV) from Settings.
+- **Google sign-in with an allow list**: only the owner and the emails the owner adds can get in. Only the owner can add or remove people. **Export** to Excel (CSV) from Settings.
 
 ## How profit is counted
 
@@ -34,14 +34,22 @@ npx wrangler login
 npx wrangler d1 create she-sleepwear
 ```
 
-Copy the `database_id` it prints into `wrangler.jsonc`, then:
+Copy the `database_id` it prints into `wrangler.jsonc`.
+
+Set up Google sign-in (free):
+1. In [Google Cloud Console](https://console.cloud.google.com), create a project, then **Google Auth Platform → Get started** (Audience: External).
+2. **Clients → Create client → Web application**. Add your app link (`https://she-sleepwear.<your-name>.workers.dev`) under **Authorized JavaScript origins**.
+3. **Audience → Publish app**.
+4. Put the **Client ID** in `GOOGLE_CLIENT_ID` and your Google email in `OWNER_EMAIL` in `wrangler.jsonc`. The client secret is not needed.
+
+Then:
 
 ```bash
 npm run db:init
 npm run deploy
 ```
 
-Open the link it shows (`https://she-sleepwear.<your-name>.workers.dev`). The first person to open it creates the owner account. Add your partner in **More → Settings**.
+Open the link it shows and sign in with the owner's Google account. Add other people in **More → Settings → Who can get in**.
 
 ## Run it on your computer
 
@@ -51,7 +59,15 @@ npm run db:init:local
 npm run dev
 ```
 
-Then open http://localhost:8787.
+Then open http://localhost:8787. For Google sign-in to work locally, also add `http://localhost:8787` to the Client's **Authorized JavaScript origins**.
+
+## Database changes
+
+Files in `migrations/` change an existing database. Run each new one once:
+
+```bash
+npx wrangler d1 execute she-sleepwear --remote --file=migrations/0002_google_login.sql
+```
 
 ## Free plan limits
 

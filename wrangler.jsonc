@@ -3,6 +3,12 @@
   "name": "she-sleepwear",
   "main": "src/index.js",
   "compatibility_date": "2025-09-01",
+  "vars": {
+    // Google sign-in. The Client ID is public (it is not a secret).
+    "GOOGLE_CLIENT_ID": "948130422997-ho39so9e3f9gmpqd6cffu29kn4sbojl1.apps.googleusercontent.com",
+    // This Google account is the owner and is always allowed in.
+    "OWNER_EMAIL": "hadialjawad718@gmail.com"
+  },
   "assets": {
     "directory": "./public",
     "binding": "ASSETS",
