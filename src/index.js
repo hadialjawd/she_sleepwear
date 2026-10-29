@@ -57,30 +57,51 @@ const round2 = (n) => Math.round(n * 100) / 100;
 const today = () => new Date().toISOString().slice(0, 10);
 const dateOr = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(v) ? v : today());
 
-// ---------- Auth ----------
+// ---------- Auth (Google sign-in + allow list) ----------
 
 function hex(buf) {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-async function hashPassword(password, saltHex) {
-  const salt = new Uint8Array(saltHex.match(/../g).map((h) => parseInt(h, 16)));
-  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: 100000 }, key, 256);
-  return hex(bits);
+const ownerEmail = (env) => String(env.OWNER_EMAIL || '').trim().toLowerCase();
+
+function b64urlBytes(s) {
+  const bin = atob(s.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((s.length + 3) % 4));
+  return Uint8Array.from(bin, (c) => c.charCodeAt(0));
 }
 
-async function createUser(env, username, password) {
-  username = str(username, 50).toLowerCase();
-  if (!/^[a-z0-9_.-]{3,50}$/.test(username)) throw new HttpError(400, 'Username: 3+ letters or numbers, no spaces');
-  if (String(password || '').length < 8) throw new HttpError(400, 'Password must be at least 8 characters');
-  const salt = hex(crypto.getRandomValues(new Uint8Array(16)));
-  const hash = await hashPassword(password, salt);
-  try {
-    await env.DB.prepare('INSERT INTO users (username, pass_hash, salt) VALUES (?, ?, ?)').bind(username, hash, salt).run();
-  } catch {
-    throw new HttpError(400, 'That username is taken');
+// Google's public keys, cached while this Worker instance lives
+let googleKeys = { keys: [], until: 0 };
+async function getGoogleKey(kid) {
+  if (Date.now() > googleKeys.until || !googleKeys.keys.some((k) => k.kid === kid)) {
+    const res = await fetch('https://www.googleapis.com/oauth2/v3/certs');
+    if (!res.ok) throw new HttpError(502, 'Could not reach Google, try again');
+    const maxAge = Number((res.headers.get('cache-control') || '').match(/max-age=(\d+)/)?.[1] || 3600);
+    googleKeys = { keys: (await res.json()).keys, until: Date.now() + maxAge * 1000 };
   }
+  return googleKeys.keys.find((k) => k.kid === kid);
+}
+
+// Checks a Google sign-in token and returns its details, or throws.
+async function verifyGoogleToken(token, env) {
+  const parts = String(token || '').split('.');
+  if (parts.length !== 3) throw new HttpError(401, 'Sign-in failed');
+  const header = JSON.parse(new TextDecoder().decode(b64urlBytes(parts[0])));
+  const claims = JSON.parse(new TextDecoder().decode(b64urlBytes(parts[1])));
+  const jwk = await getGoogleKey(header.kid);
+  if (!jwk || header.alg !== 'RS256') throw new HttpError(401, 'Sign-in failed');
+  const key = await crypto.subtle.importKey('jwk', jwk, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+  const ok = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', key, b64urlBytes(parts[2]), new TextEncoder().encode(`${parts[0]}.${parts[1]}`));
+  const now = Date.now() / 1000;
+  if (!ok
+    || claims.aud !== env.GOOGLE_CLIENT_ID
+    || !['accounts.google.com', 'https://accounts.google.com'].includes(claims.iss)
+    || claims.exp < now
+    || !claims.email
+    || (claims.email_verified !== true && claims.email_verified !== 'true')) {
+    throw new HttpError(401, 'Sign-in failed');
+  }
+  return claims;
 }
 
 async function startSession(env, userId, url) {
@@ -100,9 +121,34 @@ function getCookie(request, name) {
 async function currentUser(request, env) {
   const token = getCookie(request, 'sid');
   if (!token) return null;
-  return env.DB.prepare(
-    'SELECT u.id, u.username FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ? AND s.expires_at > ?'
+  const user = await env.DB.prepare(
+    'SELECT u.id, u.email, u.name, u.picture FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ? AND s.expires_at > ?'
   ).bind(token, new Date().toISOString()).first();
+  return user && withRole(user, env);
+}
+
+// Owner is always exactly OWNER_EMAIL, so changing that setting moves ownership
+function withRole(user, env) {
+  return { ...user, role: user.email === ownerEmail(env) ? 'owner' : 'member' };
+}
+
+async function googleLogin(request, env, url) {
+  if (!env.GOOGLE_CLIENT_ID || !ownerEmail(env)) throw new HttpError(500, 'Google sign-in is not set up yet');
+  const b = await body(request);
+  const claims = await verifyGoogleToken(b.credential, env);
+  const email = claims.email.toLowerCase();
+
+  // The owner is always allowed. Everyone else must be on the allow list.
+  if (email === ownerEmail(env)) {
+    await env.DB.prepare(
+      "INSERT INTO users (email, name, role) VALUES (?, ?, 'owner') ON CONFLICT (email) DO UPDATE SET role = 'owner'"
+    ).bind(email, str(claims.name, 100)).run();
+  }
+  const user = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first();
+  if (!user) throw new HttpError(403, `${email} is not on the allow list. Ask the owner to add you.`);
+  await env.DB.prepare('UPDATE users SET name = COALESCE(NULLIF(?, \'\'), name), picture = ?, last_login = datetime(\'now\') WHERE id = ?')
+    .bind(str(claims.name, 100), str(claims.picture, 500), user.id).run();
+  return json({ ok: true }, 200, { 'set-cookie': await startSession(env, user.id, url) });
 }
 
 // ---------- Router ----------
@@ -121,25 +167,9 @@ async function handleApi(request, env, url) {
   // Public routes
   if (resource === 'me' && method === 'GET') {
     const user = await currentUser(request, env);
-    const count = await env.DB.prepare('SELECT COUNT(*) AS n FROM users').first('n');
-    return json({ user, needsSetup: count === 0 });
+    return json({ user, googleClientId: env.GOOGLE_CLIENT_ID || null });
   }
-  if (resource === 'setup' && method === 'POST') {
-    const count = await env.DB.prepare('SELECT COUNT(*) AS n FROM users').first('n');
-    if (count > 0) throw new HttpError(400, 'Already set up');
-    const b = await body(request);
-    await createUser(env, b.username, b.password);
-    const user = await env.DB.prepare('SELECT id FROM users WHERE username = ?').bind(str(b.username, 50).toLowerCase()).first();
-    return json({ ok: true }, 200, { 'set-cookie': await startSession(env, user.id, url) });
-  }
-  if (resource === 'login' && method === 'POST') {
-    const b = await body(request);
-    const user = await env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(str(b.username, 50).toLowerCase()).first();
-    if (!user || (await hashPassword(String(b.password || ''), user.salt)) !== user.pass_hash) {
-      throw new HttpError(401, 'Wrong username or password');
-    }
-    return json({ ok: true }, 200, { 'set-cookie': await startSession(env, user.id, url) });
-  }
+  if (resource === 'login' && method === 'POST') return googleLogin(request, env, url);
   if (resource === 'logout' && method === 'POST') {
     const token = getCookie(request, 'sid');
     if (token) await env.DB.prepare('DELETE FROM sessions WHERE token = ?').bind(token).run();
@@ -151,8 +181,7 @@ async function handleApi(request, env, url) {
   if (!user) throw new HttpError(401, 'Please log in');
 
   switch (resource) {
-    case 'users': return users(request, env, method);
-    case 'password': return changePassword(request, env, user);
+    case 'users': return users(request, env, method, id, user);
     case 'settings': return settings(request, env, method);
     case 'products': return products(request, env, method, id);
     case 'shipments': return shipments(request, env, method, id, action, user);
@@ -165,32 +194,37 @@ async function handleApi(request, env, url) {
   throw new HttpError(404, 'Not found');
 }
 
-// ---------- Users & settings ----------
+// ---------- Allow list & settings ----------
 
-async function users(request, env, method) {
+async function users(request, env, method, id, me) {
   if (method === 'GET') {
-    const { results } = await env.DB.prepare('SELECT id, username, created_at FROM users ORDER BY id').all();
-    return json(results);
+    const { results } = await env.DB.prepare('SELECT id, email, name, last_login, created_at FROM users ORDER BY created_at').all();
+    return json(results.map((u) => withRole(u, env)).sort((a, b) => (b.role === 'owner') - (a.role === 'owner')));
   }
+  if (me.role !== 'owner') throw new HttpError(403, 'Only the owner can change who has access');
   if (method === 'POST') {
     const b = await body(request);
-    await createUser(env, b.username, b.password);
+    const email = str(b.email, 200).toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new HttpError(400, 'Enter a valid email');
+    try {
+      await env.DB.prepare("INSERT INTO users (email, name, role, added_by) VALUES (?, ?, 'member', ?)").bind(email, str(b.name, 100), me.id).run();
+    } catch {
+      throw new HttpError(400, 'This email is already on the list');
+    }
+    return json({ ok: true });
+  }
+  if (method === 'DELETE' && id) {
+    const target = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(int(id)).first();
+    if (!target) throw new HttpError(404, 'Not found');
+    if (target.email === ownerEmail(env)) throw new HttpError(400, 'The owner cannot be removed');
+    // Removing someone also logs them out everywhere
+    await env.DB.batch([
+      env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(target.id),
+      env.DB.prepare('DELETE FROM users WHERE id = ?').bind(target.id),
+    ]);
     return json({ ok: true });
   }
   throw new HttpError(405, 'Method not allowed');
-}
-
-async function changePassword(request, env, user) {
-  const b = await body(request);
-  const row = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(user.id).first();
-  if ((await hashPassword(String(b.current || ''), row.salt)) !== row.pass_hash) throw new HttpError(400, 'Current password is wrong');
-  if (String(b.password || '').length < 8) throw new HttpError(400, 'New password must be at least 8 characters');
-  const salt = hex(crypto.getRandomValues(new Uint8Array(16)));
-  await env.DB.batch([
-    env.DB.prepare('UPDATE users SET pass_hash = ?, salt = ? WHERE id = ?').bind(await hashPassword(b.password, salt), salt, user.id),
-    env.DB.prepare('DELETE FROM sessions WHERE user_id = ? AND token != ?').bind(user.id, getCookie(request, 'sid')),
-  ]);
-  return json({ ok: true });
 }
 
 async function settings(request, env, method) {
