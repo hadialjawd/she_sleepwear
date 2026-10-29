@@ -1,7 +1,7 @@
 // She Sleepwear: front end. Plain JavaScript, no build step.
 'use strict';
 
-const state = { user: null, rate: 89500, products: [] };
+const state = { user: null, settings: { lbp_rate: 89500, default_delivery_fee: 0, wa_confirm: '', ai_enabled: false }, products: [] };
 const view = document.getElementById('view');
 
 // ---------- Small helpers ----------
@@ -12,16 +12,36 @@ const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 const today = () => new Date().toLocaleDateString('en-CA');
 const thisMonth = () => today().slice(0, 7);
 const round2 = (n) => Math.round(n * 100) / 100;
+const rate = () => state.settings.lbp_rate || 89500;
 
 const usd = (n) => {
   const v = Number(n) || 0;
   return (v < 0 ? '-$' : '$') + Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 };
-const lbp = (n) => Math.round((Number(n) || 0) * state.rate).toLocaleString('en-US') + ' LBP';
-const toUsd = (amount, cur) => (cur === 'LBP' ? (Number(amount) || 0) / state.rate : Number(amount) || 0);
+const usd0 = (n) => {
+  const v = Math.round(Number(n) || 0);
+  return (v < 0 ? '-$' : '$') + Math.abs(v).toLocaleString('en-US');
+};
+const lbp = (n) => Math.round((Number(n) || 0) * rate()).toLocaleString('en-US') + ' LBP';
+const toUsd = (amount, cur) => (cur === 'LBP' ? (Number(amount) || 0) / rate() : Number(amount) || 0);
 const fmtDate = (d) => new Date(d + 'T00:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
-const monthName = (m) => new Date(m + '-01T00:00:00').toLocaleDateString('en-GB', { month: 'short', year: 'numeric' });
+const monthName = (m) => new Date(m + '-01T00:00:00').toLocaleDateString('en-GB', { month: 'long', year: 'numeric' });
+const monthShort = (m) => new Date(m + '-01T00:00:00').toLocaleDateString('en-GB', { month: 'short' });
 const variantName = (p) => [p.style, p.size, p.color].filter(Boolean).join(' · ');
+const SIZE_ORDER = ['XXS', 'XS', 'S', 'M', 'L', 'XL', 'XXL', '2XL', '3XL', 'XXXL'];
+const sizeRank = (s) => {
+  const i = SIZE_ORDER.indexOf(String(s).toUpperCase());
+  return i < 0 ? 100 : i;
+};
+
+const photoUrl = (p) => (p && p.photo_id ? `/api/style-photos/${p.photo_id}?v=${encodeURIComponent(p.photo_v || '')}` : '');
+const photoTag = (p, cls = '') => {
+  const url = photoUrl(p);
+  return url
+    ? `<img class="ph ${cls}" src="${url}" alt="" loading="lazy">`
+    : `<span class="ph ph-empty ${cls}" aria-hidden="true">🌙</span>`;
+};
+const stylePhoto = (style) => state.products.find((p) => p.style === style && p.photo_id);
 
 const STATUS = {
   new: 'New', sent: 'Sent', delivered: 'Delivered', paid: 'Paid', returned: 'Returned', cancelled: 'Cancelled',
@@ -58,7 +78,7 @@ function toast(msg, isErr = false) {
   t.className = 'toast' + (isErr ? ' err' : '');
   t.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => (t.hidden = true), isErr ? 4000 : 2200);
+  toastTimer = setTimeout(() => (t.hidden = true), isErr ? 4500 : 2200);
 }
 
 // Wraps a button handler: disables the button while working, shows errors.
@@ -77,23 +97,41 @@ function busy(btn, fn) {
   };
 }
 
-function setTop(title, actionHtml = '') {
+function setTop(title, actionHtml = '', back = '') {
   $('#title').textContent = title;
   $('#topAction').innerHTML = actionHtml;
+  $('#back').hidden = !back;
+  if (back) $('#back').href = back;
   document.title = title === 'She Sleepwear' ? title : `${title} · She Sleepwear`;
 }
 
+// Bottom sheet pop-up. Returns the sheet element; closeSheet() removes it.
+function openSheet(html) {
+  closeSheet();
+  $('#sheetRoot').innerHTML = `<div class="sheet-bg" data-close></div><div class="sheet" role="dialog"><div class="grab"></div>${html}</div>`;
+  $('#sheetRoot .sheet-bg').addEventListener('click', closeSheet);
+  return $('#sheetRoot .sheet');
+}
+function closeSheet() {
+  $('#sheetRoot').innerHTML = '';
+}
+
 // Money field with a USD / LBP switch. Value is always passed and read in USD.
-function moneyInput(name, valueUsd = '', label = '') {
+function moneyInput(name, valueUsd = '', label = '', hint = '') {
   const v = valueUsd === '' || valueUsd == null ? '' : round2(valueUsd);
   return `${label ? `<label for="${name}">${esc(label)}</label>` : ''}
     <div class="money">
       <input id="${name}" name="${name}" type="number" inputmode="decimal" step="any" min="0" value="${v}" placeholder="0">
       <select name="${name}_cur" aria-label="Currency"><option>USD</option><option>LBP</option></select>
-    </div>`;
+    </div>${hint ? `<div class="hint">${hint}</div>` : ''}`;
 }
 function readMoney(form, name) {
   return toUsd(form.elements[name].value, form.elements[name + '_cur'].value);
+}
+function setMoney(form, name, value, cur = 'USD') {
+  form.elements[name + '_cur'].value = cur;
+  form.elements[name + '_cur'].dataset.prev = cur;
+  form.elements[name].value = value === '' || value == null ? '' : value;
 }
 function onMoneyCurrencyChange(form, cb) {
   // Convert the number when the currency is switched, so the value stays the same
@@ -103,7 +141,7 @@ function onMoneyCurrencyChange(form, cb) {
       const input = sel.previousElementSibling;
       if (input.value !== '') {
         const asUsd = toUsd(input.value, sel.dataset.prev);
-        input.value = sel.value === 'LBP' ? Math.round(asUsd * state.rate) : round2(asUsd);
+        input.value = sel.value === 'LBP' ? Math.round(asUsd * rate()) : round2(asUsd);
       }
       sel.dataset.prev = sel.value;
       cb?.();
@@ -113,32 +151,36 @@ function onMoneyCurrencyChange(form, cb) {
 
 function seg(name, options, selected) {
   return `<div class="seg" data-seg="${name}">${Object.entries(options)
-    .map(([k, v]) => `<button type="button" data-v="${k}" class="${k === selected ? 'on' : ''}">${esc(v)}</button>`).join('')}
+    .map(([k, v]) => `<button type="button" data-v="${esc(k)}" class="${k === selected ? 'on' : ''}">${esc(v)}</button>`).join('')}
     <input type="hidden" name="${name}" value="${esc(selected)}"></div>`;
+}
+function setSeg(root, name, value) {
+  const box = $(`[data-seg="${name}"]`, root);
+  $$('button', box).forEach((x) => x.classList.toggle('on', x.dataset.v === value));
+  $('input', box).value = value;
 }
 function wireSegs(root, onChange) {
   $$('[data-seg]', root).forEach((box) => {
     box.addEventListener('click', (e) => {
       const b = e.target.closest('button[data-v]');
       if (!b) return;
-      $$('button', box).forEach((x) => x.classList.toggle('on', x === b));
-      $('input', box).value = b.dataset.v;
+      setSeg(root, box.dataset.seg, b.dataset.v);
       onChange?.(box.dataset.seg, b.dataset.v);
     });
   });
 }
 
 // Shrinks a photo so it uploads fast and stays small in the free database.
-async function shrinkImage(file, maxSide = 1600) {
+async function shrinkImage(file, maxSide = 1600, maxBytes = 1_400_000) {
   const bmp = await createImageBitmap(file);
   const scale = Math.min(1, maxSide / Math.max(bmp.width, bmp.height));
   const canvas = document.createElement('canvas');
   canvas.width = Math.round(bmp.width * scale);
   canvas.height = Math.round(bmp.height * scale);
   canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
-  for (const q of [0.75, 0.6, 0.45]) {
+  for (const q of [0.8, 0.65, 0.5, 0.4]) {
     const blob = await new Promise((r) => canvas.toBlob(r, 'image/jpeg', q));
-    if (blob.size < 1_400_000) return blob;
+    if (blob.size < maxBytes) return blob;
   }
   throw new Error('Photo is too big, try a smaller one');
 }
@@ -150,10 +192,72 @@ async function uploadReceipts(files, owner) {
     await api('receipts', { method: 'POST', form: fd });
   }
 }
+async function uploadStylePhoto(style, file) {
+  const fd = new FormData();
+  fd.append('style', style);
+  fd.append('file', await shrinkImage(file, 800, 550_000), 'photo.jpg');
+  return api('style-photos', { method: 'POST', form: fd });
+}
+async function aiRead(file, kind) {
+  const fd = new FormData();
+  fd.append('file', await shrinkImage(file), 'scan.jpg');
+  fd.append('kind', kind);
+  return (await api('ai/read', { method: 'POST', form: fd })).result;
+}
+// Opens the phone's photo picker and resolves with the chosen file (or null).
+function pickPhoto() {
+  return new Promise((resolve) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/*';
+    input.onchange = () => resolve(input.files[0] || null);
+    input.click();
+  });
+}
+
+// True if the user moved to another screen while this one was loading
+const leftPage = (hash) => location.hash !== hash;
+// Redraws a screen after a save, but only if the user is still on it
+const refresh = (page, fn) => {
+  if ((location.hash || '#/').split('?')[0] === page) fn();
+};
 
 async function loadProducts() {
   state.products = await api('products');
   return state.products;
+}
+
+// ---------- WhatsApp ----------
+
+// Lebanese numbers: "03 123 456", "+961 71 123456", "0096171123456" all become 961XXXXXXX(X).
+function waPhone(raw) {
+  let d = String(raw || '').replace(/\D/g, '');
+  if (d.startsWith('00')) d = d.slice(2);
+  if (d.startsWith('961')) d = d.slice(3);
+  if (d.startsWith('0')) d = d.slice(1);
+  if (/^3\d{6}$/.test(d) || /^(70|71|76|78|79|81)\d{6}$/.test(d)) return '961' + d;
+  return null;
+}
+function orderItemsText(order) {
+  if (order.items?.length) {
+    return order.items.map((it) => `• ${it.qty}× ${[it.style, it.color, it.size].filter(Boolean).join(' · ')}`).join('\n');
+  }
+  return String(order.summary || '').split(', ').filter(Boolean).map((s) => '• ' + s).join('\n');
+}
+function waLink(order) {
+  const phone = waPhone(order.phone);
+  if (!phone) return null;
+  const text = (state.settings.wa_confirm || 'Hi {name}! Thank you for your order 🌙\n{items}\nTotal: {total}')
+    .replaceAll('{name}', order.customer_name || '')
+    .replaceAll('{items}', orderItemsText(order))
+    .replaceAll('{total}', usd(order.total_usd).replace('.00', ''))
+    .replaceAll('{area}', order.area || '');
+  return `https://wa.me/${phone}?text=${encodeURIComponent(text)}`;
+}
+function openWhatsApp(order) {
+  const link = waLink(order);
+  if (!link) return toast('Add a valid Lebanese phone number first', true);
+  window.open(link, '_blank', 'noopener');
 }
 
 // ---------- Router ----------
@@ -174,8 +278,10 @@ const routes = [
   [/^#\/more$/, pageMore],
   [/^#\/expenses$/, pageExpenses],
   [/^#\/expenses\/new$/, pageExpenseNew],
+  [/^#\/report$/, pageReport],
   [/^#\/settings$/, pageSettings],
 ];
+const MORE_TABS = ['shipments', 'expenses', 'settings', 'report', 'more'];
 
 async function router() {
   const hash = (location.hash || '#/').split('?')[0];
@@ -183,8 +289,9 @@ async function router() {
     location.hash = '#/login';
     return;
   }
+  closeSheet();
   const tab = hash.split('/')[1] || 'home';
-  const tabName = ['expenses', 'settings'].includes(tab) ? 'more' : tab;
+  const tabName = MORE_TABS.includes(tab) ? 'more' : tab;
   $$('#tabs a').forEach((a) => a.classList.toggle('on', a.dataset.tab === tabName));
   const loggedIn = !!state.user;
   $('#tabs').hidden = !loggedIn;
@@ -204,6 +311,17 @@ async function router() {
     }
   }
   view.innerHTML = '<div class="empty">Page not found. <a href="#/">Go home</a></div>';
+}
+
+function openAddSheet() {
+  const s = openSheet(`
+    <h2>Add new</h2>
+    <div class="sheet-menu">
+      <a href="#/orders/new"><span class="em">🛍️</span><span>New order<small>A customer bought something</small></span></a>
+      <a href="#/shipments/new"><span class="em">📦</span><span>New shipment<small>Stock from Turkey${state.settings.ai_enabled ? ' · scan your notebook or receipt with AI' : ''}</small></span></a>
+      <a href="#/expenses/new"><span class="em">🧾</span><span>New expense<small>Ads, packaging, other costs</small></span></a>
+    </div>`);
+  $$('a', s).forEach((a) => a.addEventListener('click', closeSheet));
 }
 
 // ---------- Login (Google) ----------
@@ -230,11 +348,11 @@ async function pageLogin() {
     <div class="auth">
       <img class="logo" src="/icon.svg" alt="">
       <h1 class="center">She Sleepwear</h1>
-      <p class="muted center">Sign in with your Google account.</p>
+      <p class="muted center">Your shop, stock and profit in one place.</p>
       <div class="card center">
         <div id="gbtn" style="display:flex;justify-content:center;min-height:44px"></div>
         <p class="small muted" style="margin:12px 0 0">Only people the owner added can get in.</p>
-        <div id="loginErr" class="note" hidden></div>
+        <div id="loginErr" class="note bad" hidden></div>
       </div>
     </div>`;
   const showErr = (msg) => {
@@ -261,82 +379,96 @@ async function pageLogin() {
   google.accounts.id.renderButton($('#gbtn'), { theme: 'outline', size: 'large', shape: 'pill', text: 'signin_with', width: 260 });
 }
 
-// ---------- Home / dashboard ----------
+// ---------- Home (profit first) ----------
+
+function greeting() {
+  const h = new Date().getHours();
+  const part = h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening';
+  const first = String(state.user?.name || '').split(' ')[0];
+  return first ? `${part}, ${first.charAt(0).toUpperCase() + first.slice(1)}` : part;
+}
 
 async function pageHome() {
-  setTop('She Sleepwear', `<input type="month" id="month" value="${esc(window._month || thisMonth())}" style="width:auto">`);
   const month = window._month || thisMonth();
-  const d = await api('dashboard?month=' + month);
+  setTop('She Sleepwear');
+  const here = location.hash;
+  const [d] = await Promise.all([api('dashboard?month=' + month), loadProducts()]);
+  if (leftPage(here)) return;
   const maxAbs = Math.max(1, ...d.trend.map((t) => Math.abs(t.profit)));
+  const costs = d.cost_of_goods + d.delivery + d.expenses;
+  const soldOut = state.products.filter((p) => p.qty <= 0).slice(0, 12);
 
   view.innerHTML = `
+    <div class="greet"><span>${esc(greeting())} 🌙</span><input type="month" id="month" value="${esc(month)}" aria-label="Month"></div>
     <div class="card stat hero">
       <div class="label">Profit · ${esc(monthName(d.month))}</div>
       <div class="value num">${usd(d.profit)}</div>
-      <div class="sub">${lbp(d.profit)} · ${d.orders} orders · ${d.pieces_sold} pieces</div>
+      <div class="sub">${lbp(d.profit)}</div>
+      <div class="split">
+        <span>Sales<b class="num">${usd0(d.revenue)}</b></span>
+        <span>Costs<b class="num">${usd0(costs)}</b></span>
+        <span>Orders<b class="num">${d.orders}</b></span>
+        <span>Pieces<b class="num">${d.pieces_sold}</b></span>
+      </div>
     </div>
+    <p class="tiny muted" style="margin:8px 4px 0">Only Delivered or Paid orders count. Costs = real cost of pieces + delivery fees + other expenses.</p>
 
-    <div class="grid g4" style="margin-top:10px">
-      <div class="card stat"><div class="label">Sales</div><div class="value num">${usd(d.revenue)}</div></div>
-      <div class="card stat"><div class="label">Cost of pieces sold</div><div class="value num">${usd(d.cost_of_goods)}</div></div>
-      <div class="card stat"><div class="label">Delivery fees</div><div class="value num">${usd(d.delivery)}</div></div>
-      <div class="card stat"><div class="label">Other expenses</div><div class="value num">${usd(d.expenses)}</div></div>
-    </div>
-    <p class="small muted">Profit = sales − real cost of pieces sold − delivery fees − other expenses. Only orders marked Delivered or Paid count.</p>
-
-    <h2>Money to watch</h2>
-    <div class="grid">
+    <div class="grid" style="margin-top:14px">
       <a class="card stat" href="#/orders?f=owed">
         <div class="label">Drivers owe you</div>
-        <div class="value num ${d.cod_owed.amount > 0 ? 'bad' : ''}">${usd(d.cod_owed.amount)}</div>
-        <div class="sub">${d.cod_owed.orders} cash-on-delivery order${d.cod_owed.orders === 1 ? '' : 's'} delivered, not paid yet</div>
+        <div class="value num ${d.cod_owed.amount > 0 ? 'bad' : ''}">${usd0(d.cod_owed.amount)}</div>
+        <div class="sub">${d.cod_owed.orders} order${d.cod_owed.orders === 1 ? '' : 's'} delivered, not paid</div>
       </a>
       <a class="card stat" href="#/orders?f=open">
         <div class="label">Open orders</div>
         <div class="value num">${d.open_orders.orders}</div>
-        <div class="sub">${usd(d.open_orders.amount)} not delivered yet</div>
+        <div class="sub">${usd0(d.open_orders.amount)} not delivered yet</div>
       </a>
       <a class="card stat" href="#/stock">
         <div class="label">Stock on hand</div>
         <div class="value num">${d.stock.pieces} pcs</div>
-        <div class="sub">Worth ${usd(d.stock.value)} at cost</div>
+        <div class="sub">Worth ${usd0(d.stock.value)} at cost</div>
       </a>
       <a class="card stat" href="#/shipments">
-        <div class="label">Spent on stock this month</div>
-        <div class="value num">${usd(d.stock_bought)}</div>
-        <div class="sub">Shipments incl. shipping & customs</div>
+        <div class="label">Spent on stock</div>
+        <div class="value num">${usd0(d.stock_bought)}</div>
+        <div class="sub">This month, incl. shipping</div>
       </a>
     </div>
 
-    <h2>Profit, last 6 months</h2>
+    <h2>Last 6 months</h2>
     <div class="card">
       <div class="bars">${d.trend.map((t) => `
         <div class="b" title="${esc(monthName(t.month))}: ${usd(t.profit)}">
-          <span class="v">${Math.round(t.profit)}</span>
-          <div class="bar ${t.profit < 0 ? 'neg' : ''} ${t.month === d.month ? 'cur' : ''}" style="height:${Math.round((Math.abs(t.profit) / maxAbs) * 85)}%"></div>
-          <span class="m">${esc(new Date(t.month + '-01T00:00:00').toLocaleDateString('en-GB', { month: 'short' }))}</span>
+          <span class="v">${usd0(t.profit)}</span>
+          <div class="bar ${t.profit < 0 ? 'neg' : ''} ${t.month === d.month ? 'cur' : ''}" style="height:${Math.round((Math.abs(t.profit) / maxAbs) * 82)}%"></div>
+          <span class="m">${esc(monthShort(t.month))}</span>
         </div>`).join('')}
       </div>
-      <p class="small muted" style="margin:8px 0 0">In USD. Red = loss.</p>
+      <p class="tiny muted" style="margin:10px 0 0">Profit per month. Red means a loss.</p>
     </div>
 
-    <h2>Best sellers this month</h2>
-    <div class="card">${d.best_sellers.length ? `
-      <table class="table"><tr><th>Style</th><th class="num">Pieces</th><th class="num">Sales</th></tr>
-      ${d.best_sellers.map((b) => `<tr><td>${esc(b.style)}</td><td class="num">${b.pieces}</td><td class="num">${usd(b.sales)}</td></tr>`).join('')}
-      </table>` : '<div class="muted small">No sales yet this month.</div>'}
+    <h2 class="section-link">Best sellers <a href="#/report?m=${esc(d.month)}">Full report ›</a></h2>
+    <div class="card">${d.best_sellers.length ? d.best_sellers.map((b) => `
+      <div class="row" style="padding:6px 0">
+        ${photoTag(stylePhoto(b.style), 'sm')}
+        <div class="grow"><div class="bold ellipsis">${esc(b.style)}</div><div class="tiny muted">${b.pieces} pieces</div></div>
+        <div class="num bold">${usd0(b.sales)}</div>
+      </div>`).join('') : '<div class="muted small">No sales yet this month.</div>'}
     </div>
 
-    <h2>Low stock (2 or less)</h2>
-    <div class="card">${d.low_stock.length ? `
-      <table class="table">${d.low_stock.map((p) => `
-        <tr><td><a href="#/stock/${p.id}">${esc(variantName(p))}</a></td><td class="num ${p.qty <= 0 ? 'qty-low' : ''}">${p.qty}</td></tr>`).join('')}
-      </table>` : '<div class="muted small">All good.</div>'}
+    <h2>Sold out</h2>
+    <div class="card">${soldOut.length ? soldOut.map((p) => `
+      <a class="row" href="#/stock/${p.id}" style="padding:6px 0;color:inherit;text-decoration:none">
+        ${photoTag(stylePhoto(p.style), 'sm')}
+        <div class="grow ellipsis">${esc(variantName(p))}</div>
+        <span class="pill cancelled">${p.qty < 0 ? p.qty : 'Sold out'}</span>
+      </a>`).join('') : '<div class="muted small">Nothing is sold out. 🎉</div>'}
     </div>`;
 
   $('#month').addEventListener('change', (e) => {
     window._month = e.target.value || thisMonth();
-    pageHome();
+    refresh('#/', pageHome);
   });
 }
 
@@ -346,14 +478,13 @@ async function pageOrders() {
   const params = new URLSearchParams(location.hash.split('?')[1] || '');
   const filter = params.get('f') || window._orderFilter || 'all';
   window._orderFilter = filter;
-  setTop('Orders');
+  setTop('Orders', '<a class="btn small primary" href="#/orders/new">+ New</a>');
   const filters = { all: 'All', open: 'Open', owed: 'Driver owes', paid: 'Paid', returned: 'Returned', cancelled: 'Cancelled' };
 
   view.innerHTML = `
     <div class="chips" id="chips">${Object.entries(filters).map(([k, v]) => `<button data-f="${k}" class="${k === filter ? 'on' : ''}">${v}</button>`).join('')}</div>
     <input id="q" type="search" placeholder="Search name, phone, area" value="${esc(window._orderQ || '')}">
-    <div id="list" class="list" style="margin-top:12px"></div>
-    <a class="btn primary fab" href="#/orders/new">+ New order</a>`;
+    <div id="list" class="list" style="margin-top:14px"></div>`;
 
   const load = async () => {
     const q = $('#q').value.trim();
@@ -361,33 +492,39 @@ async function pageOrders() {
     const qs = new URLSearchParams();
     if (filter !== 'all') qs.set('status', filter);
     if (q) qs.set('q', q);
+    const here = location.hash;
     const rows = await api('orders?' + qs);
+    if (leftPage(here)) return;
     const list = $('#list');
     if (!rows.length) {
-      list.innerHTML = `<div class="empty">No orders here yet.</div>`;
+      list.innerHTML = `<div class="empty"><span class="big">🛍️</span>No orders here yet.<br><br><a class="btn primary" href="#/orders/new">+ New order</a></div>`;
       return;
     }
     const sum = rows.reduce((a, o) => a + o.total_usd, 0);
-    list.innerHTML = `<div class="small muted">${rows.length} orders · ${usd(sum)}</div>` + rows.map((o) => `
-      <div class="card">
+    list.innerHTML = `<div class="small muted">${rows.length} order${rows.length === 1 ? '' : 's'} · ${usd(sum)}</div>` + rows.map((o) => `
+      <div class="card order-card">
         <a href="#/orders/${o.id}" style="color:inherit;text-decoration:none;display:block">
           <div class="row between">
-            <strong class="ellipsis">${esc(o.customer_name || 'No name')}</strong>
-            <span class="num"><strong>${usd(o.total_usd)}</strong></span>
+            <strong class="ellipsis" style="font-size:16px">${esc(o.customer_name || 'No name')}</strong>
+            <span class="num serif" style="font-size:18px">${usd(o.total_usd)}</span>
           </div>
-          <div class="small muted ellipsis">${esc(o.summary || '')}</div>
-          <div class="row between small" style="margin-top:6px">
-            <span class="muted">${fmtDate(o.date)}${o.area ? ' · ' + esc(o.area) : ''} · ${esc(PAY[o.payment_method])}</span>
+          <div class="small muted ellipsis" style="margin-top:2px">${esc(o.summary || '')}</div>
+          <div class="meta small">
+            <span class="muted ellipsis">${fmtDate(o.date)}${o.area ? ' · ' + esc(o.area) : ''} · ${esc(PAY[o.payment_method])}</span>
             <span class="pill ${o.status}">${STATUS[o.status]}</span>
           </div>
         </a>
-        ${NEXT[o.status] ? `<div class="actions" style="margin-top:10px"><button class="small" data-next="${o.id}" data-to="${NEXT[o.status][0]}">${NEXT[o.status][1]}</button></div>` : ''}
+        <div class="btns">
+          ${NEXT[o.status] ? `<button class="small soft" data-next="${o.id}" data-to="${NEXT[o.status][0]}">${NEXT[o.status][1]}</button>` : ''}
+          ${o.phone ? `<button class="small wa" data-wa="${o.id}">WhatsApp</button>` : ''}
+        </div>
       </div>`).join('');
     $$('[data-next]', list).forEach((b) => b.addEventListener('click', busy(b, async () => {
       await api(`orders/${b.dataset.next}/status`, { method: 'POST', body: { status: b.dataset.to } });
       toast('Updated');
-      load();
+      refresh('#/orders', load);
     })));
+    $$('[data-wa]', list).forEach((b) => b.addEventListener('click', () => openWhatsApp(rows.find((o) => o.id === Number(b.dataset.wa)))));
   };
 
   $('#chips').addEventListener('click', (e) => {
@@ -405,60 +542,75 @@ async function pageOrders() {
 }
 
 async function pageOrderForm(id) {
+  const here = location.hash;
   const [products, order] = await Promise.all([loadProducts(), id ? api('orders/' + id) : null]);
-  setTop(id ? `Order #${id}` : 'New order');
-  const o = order || { date: today(), payment_method: 'cod', status: 'new', items: [], total_usd: '', delivery_cost_usd: '' };
+  if (leftPage(here)) return;
+  setTop(id ? `Order #${id}` : 'New order', '', '#/orders');
+  const fee = state.settings.default_delivery_fee || '';
+  const o = order || { date: today(), payment_method: 'cod', status: 'new', items: [], total_usd: '', delivery_cost_usd: fee };
 
   if (!products.length) {
-    view.innerHTML = `<div class="empty">You have no stock yet.<br><br><a class="btn primary" href="#/stock/new">Add stock</a> <a class="btn" href="#/shipments/new">Add a shipment</a></div>`;
+    view.innerHTML = `<div class="empty"><span class="big">📦</span>You have no stock yet.<br><br><a class="btn primary" href="#/shipments/new">Add a shipment</a> <a class="btn" href="#/stock/new">Add stock</a></div>`;
     return;
   }
 
-  const options = (selected) => products.map((p) =>
-    `<option value="${p.id}" ${p.id === selected ? 'selected' : ''}>${esc(variantName(p))} (${p.qty} left)</option>`).join('');
+  // Options grouped by style so the list is easy to scan
+  const byStyle = {};
+  products.forEach((p) => (byStyle[p.style] ||= []).push(p));
+  const options = (selected) => Object.entries(byStyle).map(([style, list]) => `
+    <optgroup label="${esc(style)}">${list.slice().sort((a, b) => (a.color || '').localeCompare(b.color || '') || sizeRank(a.size) - sizeRank(b.size)).map((p) =>
+      `<option value="${p.id}" ${p.id === selected ? 'selected' : ''}>${esc([p.style, p.color, p.size].filter(Boolean).join(' · '))} — ${p.qty} left</option>`).join('')}</optgroup>`).join('');
 
   const itemRow = (it = {}) => `
     <div class="item-row">
       <button type="button" class="link x" data-remove aria-label="Remove item">✕</button>
-      <label>Item</label>
-      <select name="product">${it.product_id ? '' : '<option value="">Choose…</option>'}${options(it.product_id)}</select>
+      <div class="row top">
+        <span class="pick-ph">${photoTag(products.find((p) => p.id === it.product_id))}</span>
+        <div class="grow">
+          <label style="margin-top:0">Item</label>
+          <select name="product">${it.product_id ? '' : '<option value="">Choose…</option>'}${options(it.product_id)}</select>
+        </div>
+      </div>
       <div class="fields">
         <div><label>Quantity</label><input name="qty" type="number" inputmode="numeric" min="1" value="${it.qty || 1}"></div>
         <div><label>Price each (USD)</label><input name="price" type="number" inputmode="decimal" step="any" min="0" value="${it.unit_price_usd ?? ''}"></div>
       </div>
+      <div class="hint min-note"></div>
     </div>`;
 
   view.innerHTML = `
     <form id="f">
       <div class="card">
         <div class="fields">
+          <div class="full"><label for="phone">Phone</label><input id="phone" name="phone" type="tel" inputmode="tel" value="${esc(o.phone)}" placeholder="e.g. 71 123 456" autocomplete="off"></div>
+          <div class="full hint" id="custHint"></div>
           <div class="full"><label for="customer_name">Customer name</label><input id="customer_name" name="customer_name" value="${esc(o.customer_name)}"></div>
-          <div><label for="phone">Phone</label><input id="phone" name="phone" type="tel" value="${esc(o.phone)}"></div>
           <div><label for="area">Area</label><input id="area" name="area" value="${esc(o.area)}" placeholder="e.g. Jounieh"></div>
-          <div class="full"><label for="date">Date</label><input id="date" name="date" type="date" value="${esc(o.date)}"></div>
+          <div><label for="date">Date</label><input id="date" name="date" type="date" value="${esc(o.date)}"></div>
         </div>
-        <label>Payment</label>
-        ${seg('payment_method', PAY, o.payment_method)}
-        <label>Status</label>
-        ${seg('status', STATUS, o.status)}
       </div>
 
       <h2>Items</h2>
       <div id="items">${(o.items.length ? o.items : [{}]).map(itemRow).join('')}</div>
-      <button type="button" class="block" id="addItem" style="margin-top:10px">+ Add another item</button>
+      <button type="button" class="block soft" id="addItem" style="margin-top:12px">+ Add another item</button>
 
-      <h2>Money</h2>
+      <h2>Payment & delivery</h2>
       <div class="card">
+        <label style="margin-top:0">Payment</label>
+        ${seg('payment_method', PAY, o.payment_method)}
+        <label>Status</label>
+        ${seg('status', STATUS, o.status)}
         ${moneyInput('total_usd', o.total_usd, 'Total the customer pays')}
-        <div class="small muted" id="autoNote">Fills in from the items. You can change it (for a discount).</div>
-        ${moneyInput('delivery_cost_usd', o.delivery_cost_usd, 'Delivery fee you pay (if any)')}
+        <div class="hint" id="autoNote">Fills in from the items. Change it for a discount.</div>
+        ${moneyInput('delivery_cost_usd', o.delivery_cost_usd, 'Delivery fee you pay', 'Leave empty if the customer pays the driver directly.')}
         <label for="notes">Notes</label>
-        <textarea id="notes" name="notes">${esc(o.notes)}</textarea>
+        <textarea id="notes" name="notes" placeholder="Anything to remember">${esc(o.notes)}</textarea>
         <div class="sumbox" id="sum"></div>
       </div>
 
       <div class="actions">
         <button class="primary" id="save">${id ? 'Save changes' : 'Save order'}</button>
+        ${id && o.phone ? '<button type="button" class="wa" id="waBtn">WhatsApp</button>' : ''}
         ${id ? '<button type="button" class="danger" id="del">Delete</button>' : ''}
       </div>
     </form>`;
@@ -480,8 +632,18 @@ async function pageOrderForm(id) {
     const itemsTotal = items.reduce((a, it) => a + it.qty * it.unit_price_usd, 0);
     if (!totalTouched) {
       const cur = f.total_usd_cur.value;
-      f.total_usd.value = itemsTotal ? (cur === 'LBP' ? Math.round(itemsTotal * state.rate) : round2(itemsTotal)) : '';
+      f.total_usd.value = itemsTotal ? (cur === 'LBP' ? Math.round(itemsTotal * rate()) : round2(itemsTotal)) : '';
     }
+    // Per-row photo and minimum price warning
+    $$('.item-row', f).forEach((row) => {
+      const p = products.find((x) => x.id === Number($('[name=product]', row).value));
+      $('.pick-ph', row).innerHTML = photoTag(p);
+      const price = Number($('[name=price]', row).value) || 0;
+      const min = p?.min_price_usd || 0;
+      $('.min-note', row).innerHTML = p && min && price && price < min
+        ? `<span class="bad bold">Below your minimum of ${usd(min)}</span>`
+        : p && min ? `Minimum ${usd(min)}` : '';
+    });
     const total = readMoney(f, 'total_usd');
     const cost = items.reduce((a, it) => a + it.qty * costOf(it.product_id), 0);
     const delivery = readMoney(f, 'delivery_cost_usd');
@@ -496,17 +658,45 @@ async function pageOrderForm(id) {
       <div class="row between muted small"><span></span><span class="num">${lbp(total)}</span></div>
       <div class="row between"><span>Real cost of pieces</span><span class="num">−${usd(cost)}</span></div>
       <div class="row between"><span>Delivery fee</span><span class="num">−${usd(delivery)}</span></div>
-      <div class="row between total"><span>Profit on this order</span><span class="num ${profit < 0 ? 'bad' : 'good'}">${usd(profit)}</span></div>
-      ${warn.length ? `<div class="note">Not enough stock for: ${warn.map((w) => esc(variantName(products.find((p) => p.id === w.product_id)))).join(', ')}. You can still save (stock will go below 0).</div>` : ''}`;
+      <div class="row between total"><span>Your profit</span><span class="num ${profit < 0 ? 'bad' : 'good'}">${usd(profit)}</span></div>
+      ${warn.length ? `<div class="note">Not enough stock for: ${warn.map((w) => esc(variantName(products.find((p) => p.id === w.product_id)))).join(', ')}. You can still save (stock goes below 0).</div>` : ''}`;
+  };
+
+  // Returning customer: fill name and area from their last order
+  let lookupTimer;
+  const lookup = async () => {
+    const digits = f.phone.value.replace(/\D/g, '');
+    if (digits.length < 7) {
+      $('#custHint').textContent = '';
+      return;
+    }
+    try {
+      const found = await api('customers?q=' + encodeURIComponent(digits.slice(-7)));
+      const target = waPhone(f.phone.value) || digits;
+      const c = found.find((x) => x.phone === target || x.phone.endsWith(digits.slice(-7)));
+      if (!c) {
+        $('#custHint').textContent = waPhone(f.phone.value) ? 'New customer' : 'Check the number (Lebanese mobile)';
+        return;
+      }
+      if (!f.customer_name.value) f.customer_name.value = c.name;
+      if (!f.area.value) f.area.value = c.area;
+      $('#custHint').innerHTML = `<span class="good bold">Returning customer</span> · ${c.orders_count} order${c.orders_count === 1 ? '' : 's'} · ${usd(c.total_spent)} spent`;
+    } catch {
+      $('#custHint').textContent = '';
+    }
   };
 
   wireSegs(f);
   onMoneyCurrencyChange(f, refresh);
   f.addEventListener('input', (e) => {
+    if (e.target.name === 'phone') {
+      clearTimeout(lookupTimer);
+      lookupTimer = setTimeout(lookup, 350);
+      return;
+    }
     if (e.target.name === 'total_usd') {
-      totalTouched = true;
-      $('#autoNote').textContent = 'Typed by you. Clear it to fill in from the items again.';
-      if (e.target.value === '') totalTouched = false;
+      totalTouched = e.target.value !== '';
+      $('#autoNote').textContent = totalTouched ? 'Typed by you. Clear it to fill in from the items again.' : 'Fills in from the items. Change it for a discount.';
     }
     refresh();
   });
@@ -538,9 +728,25 @@ async function pageOrderForm(id) {
       total_usd: round2(readMoney(f, 'total_usd')), delivery_cost_usd: round2(readMoney(f, 'delivery_cost_usd')),
       notes: f.notes.value, items,
     };
-    await api(id ? 'orders/' + id : 'orders', { method: id ? 'PUT' : 'POST', body: payload });
-    toast('Order saved');
-    location.hash = '#/orders';
+    const saved = await api(id ? 'orders/' + id : 'orders', { method: id ? 'PUT' : 'POST', body: payload });
+    if (id) {
+      toast('Order saved');
+      location.hash = '#/orders';
+      return;
+    }
+    // New order: offer to send the WhatsApp confirmation right away
+    const canWa = !!waPhone(saved.phone);
+    const s = openSheet(`
+      <h2>Order saved ✓</h2>
+      <p class="muted" style="margin-top:0">${esc(saved.customer_name || 'Customer')} · ${usd(saved.total_usd)}</p>
+      ${canWa ? '<button class="wa block" id="sWa">Send WhatsApp confirmation</button>' : `<div class="note">${saved.phone ? 'The phone number doesn’t look like a Lebanese mobile, so WhatsApp can’t open.' : 'No phone number, so no WhatsApp message.'}</div>`}
+      <div class="actions"><button id="sDone">Done</button><button class="soft" id="sAnother">New order</button></div>`);
+    $('#sDone', s).addEventListener('click', () => (location.hash = '#/orders'));
+    $('#sAnother', s).addEventListener('click', () => (location.hash === '#/orders/new' ? router() : (location.hash = '#/orders/new')));
+    if (canWa) $('#sWa', s).addEventListener('click', () => {
+      openWhatsApp(saved);
+      location.hash = '#/orders';
+    });
   }));
   if (id) {
     $('#del').addEventListener('click', busy($('#del'), async () => {
@@ -549,45 +755,152 @@ async function pageOrderForm(id) {
       toast('Order deleted');
       location.hash = '#/orders';
     }));
+    $('#waBtn')?.addEventListener('click', () => openWhatsApp({ ...o, ...{ customer_name: f.customer_name.value, area: f.area.value, phone: f.phone.value } }));
   }
+  if (o.phone) lookup();
   refresh();
 }
 
 // ---------- Stock ----------
 
+function groupStyles(products) {
+  const groups = new Map();
+  products.forEach((p) => {
+    if (!groups.has(p.style)) groups.set(p.style, []);
+    groups.get(p.style).push(p);
+  });
+  return [...groups.entries()].map(([style, list]) => {
+    const first = list.find((p) => p.photo_id) || list[0];
+    return {
+      style, list, photo: first,
+      code: list.find((p) => p.code)?.code || '',
+      price: Math.max(...list.map((p) => p.sale_price_usd || 0)),
+      min: Math.max(...list.map((p) => p.min_price_usd || 0)),
+      cost: list.reduce((a, p) => a + Math.max(p.qty, 0) * p.avg_cost_usd, 0) / Math.max(1, list.reduce((a, p) => a + Math.max(p.qty, 0), 0)),
+      pieces: list.reduce((a, p) => a + Math.max(p.qty, 0), 0),
+    };
+  });
+}
+
+function matrixHtml(list) {
+  const sizes = [...new Set(list.map((p) => p.size || '—'))].sort((a, b) => sizeRank(a) - sizeRank(b) || a.localeCompare(b));
+  const colors = [...new Set(list.map((p) => p.color || '—'))];
+  return `<table class="matrix"><tr><th class="color">Color</th>${sizes.map((s) => `<th>${esc(s)}</th>`).join('')}</tr>
+    ${colors.map((c) => `<tr><td class="color">${esc(c)}</td>${sizes.map((s) => {
+      const p = list.find((x) => (x.color || '—') === c && (x.size || '—') === s);
+      if (!p) return '<td class="q none"></td>';
+      return `<td class="q ${p.qty <= 0 ? 'zero' : ''}" data-pid="${p.id}" title="${esc(variantName(p))}">${p.qty}</td>`;
+    }).join('')}</tr>`).join('')}</table>`;
+}
+
 async function pageStock() {
   setTop('Stock', '<a class="btn small primary" href="#/stock/new">+ Add</a>');
+  const here = location.hash;
   const products = await loadProducts();
-  view.innerHTML = `<input id="q" type="search" placeholder="Search style, color, size" value="${esc(window._stockQ || '')}"><div id="list"></div>`;
+  if (leftPage(here)) return;
+  view.innerHTML = `<input id="q" type="search" placeholder="Search style, code, color, size" value="${esc(window._stockQ || '')}"><div id="list"></div>`;
 
   const draw = () => {
     const q = $('#q').value.trim().toLowerCase();
     window._stockQ = q;
-    const rows = products.filter((p) => !q || variantName(p).toLowerCase().includes(q));
+    const rows = products.filter((p) => !q || `${variantName(p)} ${p.code || ''}`.toLowerCase().includes(q));
     if (!rows.length) {
-      $('#list').innerHTML = `<div class="empty">${products.length ? 'Nothing matches.' : 'No stock yet. Add a shipment from Turkey, or add stock by hand.'}</div>`;
+      $('#list').innerHTML = `<div class="empty"><span class="big">📦</span>${products.length ? 'Nothing matches.' : 'No stock yet. Add a shipment from Turkey, or add stock by hand.'}</div>`;
       return;
     }
-    const groups = {};
-    rows.forEach((p) => (groups[p.style] ||= []).push(p));
-    const pieces = rows.reduce((a, p) => a + Math.max(p.qty, 0), 0);
-    $('#list').innerHTML = `<p class="small muted">${pieces} pieces in stock</p>` + Object.entries(groups).map(([style, list]) => `
-      <div class="group-title"><span>${esc(style)}</span><span class="muted small">${list.reduce((a, p) => a + Math.max(p.qty, 0), 0)} pcs</span></div>
-      <div class="card" style="padding:6px 12px">
-        <table class="table">
-          <tr><th>Color</th><th>Size</th><th class="num">Left</th><th class="num">Cost</th><th class="num">Price</th></tr>
-          ${list.map((p) => `
-            <tr data-id="${p.id}" style="cursor:pointer">
-              <td>${esc(p.color || '—')}</td><td>${esc(p.size || '—')}</td>
-              <td class="num ${p.qty <= 2 ? 'qty-low' : ''}">${p.qty}</td>
-              <td class="num">${usd(p.avg_cost_usd)}</td><td class="num">${usd(p.sale_price_usd)}</td>
-            </tr>`).join('')}
-        </table>
-      </div>`).join('') + '<p class="small muted">Cost = real cost per piece, including shipping and customs. Tap a row to edit.</p>';
-    $$('tr[data-id]').forEach((tr) => tr.addEventListener('click', () => (location.hash = '#/stock/' + tr.dataset.id)));
+    const styles = groupStyles(rows);
+    const pieces = styles.reduce((a, s) => a + s.pieces, 0);
+    $('#list').innerHTML = `<p class="small muted">${pieces} pieces in ${styles.length} style${styles.length === 1 ? '' : 's'}. Tap a number to edit it.</p>` + styles.map((s) => `
+      <div class="card" style="margin-top:12px">
+        <div class="row top">
+          <button type="button" class="link" data-photo="${esc(s.style)}" style="padding:0" aria-label="Photo for ${esc(s.style)}">${photoTag(s.photo, 'lg')}</button>
+          <div class="grow">
+            <div class="row between top">
+              <h3 class="serif" style="font-size:19px;font-weight:600">${esc(s.style)}</h3>
+              <button type="button" class="small" data-edit-style="${esc(s.style)}">Edit</button>
+            </div>
+            <div class="small muted" style="margin-top:2px">
+              ${s.code ? `<span class="pill code">${esc(s.code)}</span> ` : ''}
+              Sell ${usd(s.price)}${s.min ? ` · min ${usd(s.min)}` : ''} · cost ${usd(s.cost)}
+            </div>
+            <div class="small" style="margin-top:2px"><b>${s.pieces}</b> pcs left</div>
+          </div>
+        </div>
+        ${matrixHtml(s.list)}
+      </div>`).join('') + '<p class="tiny muted" style="margin-top:12px">Cost = real cost per piece, including shipping and customs. Red = sold out.</p>';
+
+    $$('td[data-pid]').forEach((td) => td.addEventListener('click', () => (location.hash = '#/stock/' + td.dataset.pid)));
+    $$('[data-edit-style]').forEach((b) => b.addEventListener('click', () => editStyleSheet(styles.find((s) => s.style === b.dataset.editStyle))));
+    $$('[data-photo]').forEach((b) => b.addEventListener('click', async () => {
+      const file = await pickPhoto();
+      if (!file) return;
+      try {
+        toast('Uploading photo…');
+        await uploadStylePhoto(b.dataset.photo, file);
+        toast('Photo saved');
+        refresh('#/stock', pageStock);
+      } catch (err) {
+        toast(err.message, true);
+      }
+    }));
   };
   $('#q').addEventListener('input', draw);
   draw();
+}
+
+function editStyleSheet(s) {
+  const sheet = openSheet(`
+    <h2>Edit style</h2>
+    <form id="sf">
+      <div class="row" style="gap:14px">
+        <span id="sfPh">${photoTag(s.photo, 'lg')}</span>
+        <div class="grow">
+          <button type="button" class="small soft" id="sfPhoto">${s.photo?.photo_id ? 'Change photo' : 'Add photo'}</button>
+          ${s.photo?.photo_id ? '<button type="button" class="small link" id="sfPhotoDel">Remove</button>' : ''}
+        </div>
+      </div>
+      <label for="sfName">Style name</label><input id="sfName" name="new_style" value="${esc(s.style)}" required>
+      <label for="sfCode">Supplier code(s)</label><input id="sfCode" name="code" value="${esc(s.code)}" placeholder="e.g. 23522">
+      <div class="fields">
+        <div><label for="sfPrice">Selling price (USD)</label><input id="sfPrice" name="sale_price_usd" type="number" inputmode="decimal" step="any" min="0" value="${s.price || ''}"></div>
+        <div><label for="sfMin">Minimum price (USD)</label><input id="sfMin" name="min_price_usd" type="number" inputmode="decimal" step="any" min="0" value="${s.min || ''}"></div>
+      </div>
+      <p class="hint">Changes apply to every color and size of this style.</p>
+      <div class="actions"><button class="primary" id="sfSave">Save</button><button type="button" id="sfCancel">Cancel</button></div>
+    </form>`);
+  const f = $('#sf', sheet);
+  $('#sfCancel', sheet).addEventListener('click', closeSheet);
+  $('#sfPhoto', sheet).addEventListener('click', async () => {
+    const file = await pickPhoto();
+    if (!file) return;
+    try {
+      toast('Uploading photo…');
+      await uploadStylePhoto(s.style, file);
+      toast('Photo saved');
+      closeSheet();
+      refresh('#/stock', pageStock);
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
+  $('#sfPhotoDel', sheet)?.addEventListener('click', async () => {
+    if (!confirm('Remove this photo?')) return;
+    await api('style-photos/' + s.photo.photo_id, { method: 'DELETE' });
+    closeSheet();
+    refresh('#/stock', pageStock);
+  });
+  f.addEventListener('submit', busy($('#sfSave', sheet), async () => {
+    await api('styles', {
+      method: 'PUT',
+      body: {
+        style: s.style, new_style: f.new_style.value.trim(), code: f.code.value.trim(),
+        sale_price_usd: Number(f.sale_price_usd.value) || 0, min_price_usd: Number(f.min_price_usd.value) || 0,
+      },
+    });
+    toast('Style saved');
+    closeSheet();
+    refresh('#/stock', pageStock);
+  }));
 }
 
 function datalists(products) {
@@ -599,22 +912,25 @@ function datalists(products) {
 }
 
 async function pageStockNew() {
-  setTop('Add stock');
+  setTop('Add stock', '', '#/stock');
+  const here = location.hash;
   const products = await loadProducts();
+  if (leftPage(here)) return;
   view.innerHTML = `
     ${datalists(products)}
-    <form id="f" class="card">
-      <p class="small muted" style="margin-top:0">Tip: stock from Turkey is best added with a <a href="#/shipments/new">shipment</a>, so shipping and customs are counted in the cost. Use this for stock you already have.</p>
-      <label for="style">Style name</label><input id="style" name="style" list="dl-style" required placeholder="e.g. Satin set">
-      <label for="color">Color</label><input id="color" name="color" list="dl-color" placeholder="e.g. Pink">
-      <label for="sizes">Sizes (separate with commas)</label><input id="sizes" name="sizes" placeholder="S, M, L, XL">
+    <div class="note info" style="margin-top:0">Stock from Turkey is best added as a <a href="#/shipments/new">shipment</a>, so shipping and customs count in the cost. Use this for stock you already have.</div>
+    <form id="f" class="card" style="margin-top:14px">
+      <label for="style" style="margin-top:0">Style name</label><input id="style" name="style" list="dl-style" required placeholder="e.g. Smile">
       <div class="fields">
-        <div><label for="qty">Quantity per size</label><input id="qty" name="qty" type="number" inputmode="numeric" value="0"></div>
-        <div></div>
+        <div><label for="code">Supplier code</label><input id="code" name="code" placeholder="e.g. 23522"></div>
+        <div><label for="color">Color</label><input id="color" name="color" list="dl-color" placeholder="e.g. Teal"></div>
       </div>
+      <label for="sizes">Sizes (separate with commas)</label><input id="sizes" name="sizes" placeholder="S, M, L, XL">
+      <label for="qty">Quantity per size</label><input id="qty" name="qty" type="number" inputmode="numeric" value="1">
       ${moneyInput('cost', '', 'Real cost per piece')}
       ${moneyInput('price', '', 'Selling price')}
-      <div class="actions"><button class="primary" id="save">Add</button></div>
+      ${moneyInput('min', '', 'Minimum price (optional)')}
+      <div class="actions"><button class="primary" id="save">Add to stock</button></div>
     </form>`;
   const f = $('#f');
   onMoneyCurrencyChange(f);
@@ -623,7 +939,10 @@ async function pageStockNew() {
     for (const size of sizes.length ? sizes : ['']) {
       await api('products', {
         method: 'POST',
-        body: { style: f.style.value, color: f.color.value, size, qty: Number(f.qty.value) || 0, avg_cost_usd: round2(readMoney(f, 'cost')), sale_price_usd: round2(readMoney(f, 'price')) },
+        body: {
+          style: f.style.value, color: f.color.value, size, code: f.code.value, qty: Number(f.qty.value) || 0,
+          avg_cost_usd: round2(readMoney(f, 'cost')), sale_price_usd: round2(readMoney(f, 'price')), min_price_usd: round2(readMoney(f, 'min')),
+        },
       });
     }
     toast('Stock added');
@@ -632,22 +951,26 @@ async function pageStockNew() {
 }
 
 async function pageStockEdit(id) {
-  setTop('Edit stock');
+  setTop('Edit item', '', '#/stock');
+  const here = location.hash;
   const products = await loadProducts();
+  if (leftPage(here)) return;
   const p = products.find((x) => x.id === Number(id));
   if (!p) throw new Error('Not found');
   view.innerHTML = `
     ${datalists(products)}
-    <form id="f" class="card">
-      <label for="style">Style name</label><input id="style" name="style" list="dl-style" required value="${esc(p.style)}">
+    <div class="card row" style="gap:14px">${photoTag(p, 'lg')}<div class="grow"><h3 class="serif" style="font-size:19px;font-weight:600">${esc(p.style)}</h3>
+      <div class="small muted">${p.code ? `<span class="pill code">${esc(p.code)}</span> ` : ''}${p.min_price_usd ? `Min ${usd(p.min_price_usd)}` : ''}</div>
+      <div class="tiny muted" style="margin-top:4px">Name, code, price and photo for the whole style: Stock → Edit.</div></div></div>
+    <form id="f" class="card" style="margin-top:12px">
       <div class="fields">
-        <div><label for="color">Color</label><input id="color" name="color" list="dl-color" value="${esc(p.color)}"></div>
-        <div><label for="size">Size</label><input id="size" name="size" list="dl-size" value="${esc(p.size)}"></div>
+        <div><label for="color" style="margin-top:0">Color</label><input id="color" name="color" list="dl-color" value="${esc(p.color)}"></div>
+        <div><label for="size" style="margin-top:0">Size</label><input id="size" name="size" list="dl-size" value="${esc(p.size)}"></div>
       </div>
       <label for="qty">Quantity in stock</label><input id="qty" name="qty" type="number" inputmode="numeric" value="${p.qty}">
       ${moneyInput('cost', p.avg_cost_usd, 'Real cost per piece')}
       ${moneyInput('price', p.sale_price_usd, 'Selling price')}
-      <div class="small muted" id="margin"></div>
+      <div class="hint" id="margin"></div>
       <div class="actions">
         <button class="primary" id="save">Save</button>
         <button type="button" class="danger" id="del">Delete</button>
@@ -665,7 +988,10 @@ async function pageStockEdit(id) {
   f.addEventListener('submit', busy($('#save'), async () => {
     await api('products/' + id, {
       method: 'PUT',
-      body: { style: f.style.value, color: f.color.value, size: f.size.value, qty: Number(f.qty.value) || 0, avg_cost_usd: round2(readMoney(f, 'cost')), sale_price_usd: round2(readMoney(f, 'price')) },
+      body: {
+        style: p.style, code: p.code, min_price_usd: p.min_price_usd, color: f.color.value, size: f.size.value,
+        qty: Number(f.qty.value) || 0, avg_cost_usd: round2(readMoney(f, 'cost')), sale_price_usd: round2(readMoney(f, 'price')),
+      },
     });
     toast('Saved');
     location.hash = '#/stock';
@@ -681,63 +1007,77 @@ async function pageStockEdit(id) {
 // ---------- Shipments ----------
 
 async function pageShipments() {
-  setTop('Shipments');
+  setTop('Shipments', '<a class="btn small primary" href="#/shipments/new">+ New</a>', '#/more');
+  const here = location.hash;
   const rows = await api('shipments');
+  if (leftPage(here)) return;
   view.innerHTML = `
     <p class="small muted" style="margin-top:0">Each shipment from Turkey. When it arrives, the app splits shipping and customs over every piece and adds them to stock.</p>
     <div class="list">${rows.length ? rows.map((s) => `
       <a class="card" href="#/shipments/${s.id}">
-        <div class="row between"><strong>${esc(s.supplier || 'Shipment')} </strong><span class="pill ${s.status}">${s.status === 'arrived' ? 'Arrived' : 'On the way'}</span></div>
-        <div class="row between small" style="margin-top:4px">
+        <div class="row between"><strong>${esc(s.supplier || 'Shipment')}</strong><span class="pill ${s.status}">${s.status === 'arrived' ? 'Arrived' : 'On the way'}</span></div>
+        <div class="row between small" style="margin-top:6px">
           <span class="muted">${fmtDate(s.date)} · ${s.pieces} pcs${s.receipt_count ? ` · ${s.receipt_count} receipt${s.receipt_count > 1 ? 's' : ''}` : ''}</span>
-          <strong class="num">${usd(s.goods_usd + s.shipping_usd + s.customs_usd + s.other_usd)}</strong>
+          <strong class="num serif" style="font-size:17px">${usd(s.goods_usd + s.shipping_usd + s.customs_usd + s.other_usd)}</strong>
         </div>
-      </a>`).join('') : '<div class="empty">No shipments yet.</div>'}
-    </div>
-    <a class="btn primary fab" href="#/shipments/new">+ New shipment</a>`;
+      </a>`).join('') : '<div class="empty"><span class="big">📦</span>No shipments yet.</div>'}
+    </div>`;
 }
 
 async function pageShipmentForm(id) {
+  const here = location.hash;
   const [products, s] = await Promise.all([loadProducts(), id ? api('shipments/' + id) : null]);
+  if (leftPage(here)) return;
   if (s && s.status === 'arrived') {
     location.hash = '#/shipments/' + id;
     return;
   }
-  setTop(id ? 'Edit shipment' : 'New shipment');
+  setTop(id ? 'Edit shipment' : 'New shipment', '', id ? '#/shipments/' + id : '#/shipments');
   const sh = s || { date: today(), supplier: '', items: [], shipping_usd: '', customs_usd: '', other_usd: '', notes: '' };
+  const scanned = []; // photos read by AI, saved as receipts with the shipment
 
-  const itemRow = (it = {}) => `
-    <div class="item-row">
+  const itemRow = (it = {}, ai = false) => `
+    <div class="item-row ${ai ? 'ai' : ''}">
       <button type="button" class="link x" data-remove aria-label="Remove item">✕</button>
-      <label>Style</label><input name="style" list="dl-style" value="${esc(it.style)}" placeholder="e.g. Satin set">
       <div class="fields">
+        <div class="full"><label style="margin-top:0">Style</label><input name="style" list="dl-style" value="${esc(it.style)}" placeholder="e.g. Smile"></div>
+        <div><label>Code</label><input name="code" value="${esc(it.code)}" placeholder="e.g. 23522"></div>
         <div><label>Color</label><input name="color" list="dl-color" value="${esc(it.color)}"></div>
         <div><label>Size</label><input name="size" list="dl-size" value="${esc(it.size)}"></div>
         <div><label>Quantity</label><input name="qty" type="number" inputmode="numeric" min="1" value="${it.qty || ''}"></div>
-        <div><label>Price each</label><input name="cost" type="number" inputmode="decimal" step="any" min="0" value="${it.unit_cost_usd ?? ''}"></div>
+        <div class="full"><label>Price each (wholesale)</label><input name="cost" type="number" inputmode="decimal" step="any" min="0" value="${it.unit_cost_usd ?? it.unit_cost ?? ''}"></div>
       </div>
     </div>`;
 
   view.innerHTML = `
     ${datalists(products)}
+    ${!id && state.settings.ai_enabled ? `
+    <div class="card" style="background:var(--blush-2);border-color:var(--blush)">
+      <div class="row top"><span style="font-size:26px">✨</span><div class="grow">
+        <h3>Fill it with AI</h3>
+        <p class="small muted" style="margin:2px 0 10px">Take a photo of the supplier receipt or your notebook page. The app fills in the items. Check every line before saving.</p>
+        <button type="button" class="primary block" id="aiBtn">Scan a photo</button>
+        <div id="aiNote"></div>
+      </div></div>
+    </div>` : ''}
     <form id="f">
-      <div class="card">
+      <div class="card" style="margin-top:14px">
         <div class="fields">
-          <div><label for="date">Date</label><input id="date" name="date" type="date" value="${esc(sh.date)}"></div>
-          <div><label for="supplier">Supplier</label><input id="supplier" name="supplier" value="${esc(sh.supplier)}" placeholder="Name in Turkey"></div>
+          <div><label for="date" style="margin-top:0">Date</label><input id="date" name="date" type="date" value="${esc(sh.date)}"></div>
+          <div><label for="supplier" style="margin-top:0">Supplier</label><input id="supplier" name="supplier" value="${esc(sh.supplier)}" placeholder="Name in Turkey"></div>
         </div>
         <label>Item prices are in</label>
         ${seg('item_cur', { USD: 'USD', LBP: 'LBP' }, 'USD')}
       </div>
 
-      <h2>Items in this shipment</h2>
-      <div id="items">${(sh.items.length ? sh.items : [{}]).map(itemRow).join('')}</div>
-      <button type="button" class="block" id="addItem" style="margin-top:10px">+ Add another item</button>
+      <h2>Items</h2>
+      <div id="items">${(sh.items.length ? sh.items : [{}]).map((it) => itemRow(it)).join('')}</div>
+      <button type="button" class="block soft" id="addItem" style="margin-top:12px">+ Add another item</button>
 
       <h2>Extra costs</h2>
       <div class="card">
-        ${moneyInput('shipping_usd', sh.shipping_usd, 'Shipping (Turkey → Lebanon)')}
-        ${moneyInput('customs_usd', sh.customs_usd, 'Customs')}
+        ${moneyInput('shipping_usd', sh.shipping_usd, 'Shipping (Turkey → Lebanon), total')}
+        ${moneyInput('customs_usd', sh.customs_usd, 'Customs, total')}
         ${moneyInput('other_usd', sh.other_usd, 'Other (pickup, fees…)')}
         <label for="notes">Notes</label><textarea id="notes" name="notes">${esc(sh.notes)}</textarea>
         ${id ? '' : `<label for="photos">Receipt photos (optional)</label><input id="photos" type="file" accept="image/*" multiple>`}
@@ -752,6 +1092,7 @@ async function pageShipmentForm(id) {
     const cur = f.item_cur.value;
     return $$('.item-row', f).map((row) => ({
       style: $('[name=style]', row).value.trim(),
+      code: $('[name=code]', row).value.trim(),
       color: $('[name=color]', row).value.trim(),
       size: $('[name=size]', row).value.trim(),
       qty: Number($('[name=qty]', row).value) || 0,
@@ -768,7 +1109,7 @@ async function pageShipmentForm(id) {
       <div class="row between"><span>Clothes</span><span class="num">${usd(goods)}</span></div>
       <div class="row between"><span>Shipping + customs + other</span><span class="num">${usd(extra)}</span></div>
       <div class="row between total"><span>Total cost</span><span class="num">${usd(goods + extra)}</span></div>
-      ${pieces ? `<div class="row between small" style="margin-top:6px"><span>Extra cost added to each piece</span><span class="num">+${usd(extra / pieces)}</span></div>
+      ${pieces ? `<div class="row between small" style="margin-top:6px"><span>Extra cost per piece</span><span class="num">+${usd(extra / pieces)}</span></div>
       <div class="row between small"><span>Average real cost per piece</span><span class="num"><strong>${usd((goods + extra) / pieces)}</strong></span></div>` : ''}`;
   };
   wireSegs(f, refresh);
@@ -781,18 +1122,49 @@ async function pageShipmentForm(id) {
     }
   });
   $('#addItem').addEventListener('click', () => {
-    // Copy style and color from the last row, since one style often comes in many sizes
+    // Copy style, code and color from the last row, since one style often comes in many sizes
     const rows = $$('.item-row', f);
     const last = rows[rows.length - 1];
-    $('#items').insertAdjacentHTML('beforeend', itemRow({
-      style: last ? $('[name=style]', last).value : '',
-      color: last ? $('[name=color]', last).value : '',
-      unit_cost_usd: last ? $('[name=cost]', last).value : '',
-    }));
-    const added = $$('.item-row', f).pop();
-    $('[name=size]', added).focus();
+    const val = (n) => (last ? $(`[name=${n}]`, last).value : '');
+    $('#items').insertAdjacentHTML('beforeend', itemRow({ style: val('style'), code: val('code'), color: val('color'), unit_cost_usd: val('cost') }));
+    $('[name=size]', $$('.item-row', f).pop()).focus();
     refresh();
   });
+
+  $('#aiBtn')?.addEventListener('click', busy($('#aiBtn'), async () => {
+    const file = await pickPhoto();
+    if (!file) return;
+    const btn = $('#aiBtn');
+    btn.innerHTML = '<span class="spinner"></span> Reading the photo…';
+    try {
+      const r = await aiRead(file, 'shipment');
+      scanned.push(file);
+      if (!r.items.length) throw new Error('The AI found no items. Try a clearer photo, or type them in.');
+      // If the form only has one empty row, replace it; otherwise add after what's there
+      const rows = $$('.item-row', f);
+      if (rows.length === 1 && !$('[name=style]', rows[0]).value) rows[0].remove();
+      $('#items').insertAdjacentHTML('beforeend', r.items.map((it) => itemRow(it, true)).join(''));
+      if (r.supplier && !f.supplier.value) f.supplier.value = r.supplier;
+      if (r.date) f.date.value = r.date;
+      const cur = r.currency === 'LBP' ? 'LBP' : 'USD';
+      setSeg(f, 'item_cur', cur);
+      const add = (name, v) => {
+        if (!v) return;
+        const prev = readMoney(f, name);
+        setMoney(f, name, cur === 'LBP' ? Math.round(prev * rate() + v) : round2(prev + v), cur);
+      };
+      add('shipping_usd', r.shipping);
+      add('customs_usd', r.customs);
+      add('other_usd', r.other);
+      if (r.notes) f.notes.value = [f.notes.value, r.notes].filter(Boolean).join('\n');
+      const pieces = r.items.reduce((a, it) => a + it.qty, 0);
+      const odd = r.currency && !['USD', 'LBP'].includes(r.currency);
+      $('#aiNote').innerHTML = `<div class="note ${odd ? '' : 'info'}">Filled ${r.items.length} line${r.items.length === 1 ? '' : 's'} (${pieces} pieces). Pink lines came from the AI, so <b>check each one</b>.${odd ? ` Prices look like <b>${esc(r.currency)}</b>; change them to USD before saving.` : ''}</div>`;
+      refresh();
+    } finally {
+      btn.textContent = 'Scan another photo';
+    }
+  }));
 
   f.addEventListener('submit', busy($('#save'), async () => {
     const items = readItems();
@@ -802,8 +1174,11 @@ async function pageShipmentForm(id) {
       shipping_usd: round2(readMoney(f, 'shipping_usd')), customs_usd: round2(readMoney(f, 'customs_usd')), other_usd: round2(readMoney(f, 'other_usd')),
     };
     const saved = await api(id ? 'shipments/' + id : 'shipments', { method: id ? 'PUT' : 'POST', body: payload });
-    const photos = $('#photos')?.files;
-    if (photos?.length) await uploadReceipts(photos, { type: 'shipment', id: saved.id });
+    // Save supplier codes on the styles (shipments don't store them)
+    const codes = new Map(items.filter((it) => it.code).map((it) => [it.style, it.code]));
+    for (const [style, code] of codes) await api('styles', { method: 'PUT', body: { style, code } }).catch(() => {});
+    const photos = [...scanned, ...($('#photos')?.files || [])];
+    if (photos.length) await uploadReceipts(photos, { type: 'shipment', id: saved.id });
     toast('Shipment saved');
     location.hash = '#/shipments/' + saved.id;
   }));
@@ -811,8 +1186,10 @@ async function pageShipmentForm(id) {
 }
 
 async function pageShipment(id) {
-  const s = await api('shipments/' + id);
-  setTop(s.supplier || 'Shipment');
+  const here = location.hash;
+  const [s] = await Promise.all([api('shipments/' + id), loadProducts()]);
+  if (leftPage(here)) return;
+  setTop(s.supplier || 'Shipment', '', '#/shipments');
   const arrived = s.status === 'arrived';
   const pieces = s.items.reduce((a, it) => a + it.qty, 0);
   const goods = s.items.reduce((a, it) => a + it.qty * it.unit_cost_usd, 0);
@@ -838,7 +1215,7 @@ async function pageShipment(id) {
       ${s.notes ? `<p class="small" style="white-space:pre-wrap">${esc(s.notes)}</p>` : ''}
     </div>
 
-    ${arrived ? '' : `<div class="note">When the clothes arrive, tap <strong>Arrived</strong>. The pieces are added to your stock with their real cost. After that, the shipment can't be changed.</div>`}
+    ${arrived ? '' : `<div class="note">When the clothes arrive, tap <b>Arrived</b>. The pieces go into stock with their real cost. After that, the shipment can't be changed.</div>`}
 
     <h2>Receipts</h2>
     <div class="card">
@@ -856,7 +1233,7 @@ async function pageShipment(id) {
       toast('Uploading…');
       await uploadReceipts(e.target.files, { type: 'shipment', id });
       toast('Receipt saved');
-      pageShipment(id);
+      refresh('#/shipments/' + id, () => pageShipment(id));
     } catch (err) {
       toast(err.message, true);
     }
@@ -866,7 +1243,7 @@ async function pageShipment(id) {
       if (!confirm(`Add ${pieces} pieces to stock? Each piece gets +${usd(perPiece)} for shipping and customs.`)) return;
       await api(`shipments/${id}/arrive`, { method: 'POST' });
       toast('Added to stock');
-      pageShipment(id);
+      refresh('#/shipments/' + id, () => pageShipment(id));
     }));
     $('#del').addEventListener('click', busy($('#del'), async () => {
       if (!confirm('Delete this shipment?')) return;
@@ -876,54 +1253,61 @@ async function pageShipment(id) {
   }
 }
 
-// ---------- More, expenses, settings ----------
+// ---------- More ----------
 
 async function pageMore() {
   setTop('More');
   view.innerHTML = `
     <div class="card menu">
-      <a href="#/expenses"><span>Expenses <span class="muted small">(ads, packaging…)</span></span><span>›</span></a>
-      <a href="#/settings"><span>Settings, people & export</span><span>›</span></a>
+      <a href="#/report"><span class="em">📊</span><span class="grow">Monthly report<small>Profit, best sizes & colors, print or PDF</small></span><span>›</span></a>
+      <a href="#/shipments"><span class="em">📦</span><span class="grow">Shipments<small>Stock from Turkey, receipts</small></span><span>›</span></a>
+      <a href="#/expenses"><span class="em">🧾</span><span class="grow">Expenses<small>Ads, packaging, other costs</small></span><span>›</span></a>
+      <a href="#/settings"><span class="em">⚙️</span><span class="grow">Settings<small>Dollar rate, WhatsApp text, people, backup</small></span><span>›</span></a>
     </div>
-    <p class="small muted center" style="margin-top:20px">Signed in as <strong>${esc(state.user.email)}</strong>${state.user.role === 'owner' ? ' (owner)' : ''}</p>`;
+    <p class="small muted center" style="margin-top:22px">Signed in as <strong>${esc(state.user.email)}</strong>${state.user.role === 'owner' ? ' (owner)' : ''}</p>`;
 }
+
+// ---------- Expenses ----------
 
 async function pageExpenses() {
   const month = window._expMonth || thisMonth();
-  setTop('Expenses', `<input type="month" id="month" value="${esc(month)}" style="width:auto">`);
+  setTop('Expenses', `<input type="month" id="month" value="${esc(month)}" style="width:auto;padding:8px 10px" aria-label="Month">`, '#/more');
+  const here = location.hash;
   const rows = await api('expenses?month=' + month);
+  if (leftPage(here)) return;
   const total = rows.reduce((a, e) => a + e.amount_usd, 0);
   view.innerHTML = `
-    <p class="small muted" style="margin-top:0">Costs that are not stock: ads, bags, packaging and so on. Shipments are tracked separately.</p>
     <div class="card stat"><div class="label">Total · ${esc(monthName(month))}</div><div class="value num">${usd(total)}</div><div class="sub">${lbp(total)}</div></div>
-    <div class="list" style="margin-top:10px">${rows.map((e) => `
+    <p class="tiny muted" style="margin:8px 4px 0">Costs that are not stock: ads, bags, packaging. Shipments are tracked separately.</p>
+    <div class="list" style="margin-top:12px">${rows.map((e) => `
       <div class="card row">
         <div class="grow">
           <strong>${esc(e.category)}</strong> <span class="muted small">${fmtDate(e.date)}</span>
           ${e.note ? `<div class="small muted">${esc(e.note)}</div>` : ''}
           ${e.receipt_id ? `<a class="small" href="/api/receipts/${e.receipt_id}" target="_blank" rel="noopener">View receipt</a>` : ''}
         </div>
-        <strong class="num">${usd(e.amount_usd)}</strong>
+        <strong class="num serif" style="font-size:17px">${usd(e.amount_usd)}</strong>
         <button class="link" data-del="${e.id}" aria-label="Delete">✕</button>
-      </div>`).join('') || '<div class="empty">No expenses this month.</div>'}
+      </div>`).join('') || '<div class="empty"><span class="big">🧾</span>No expenses this month.</div>'}
     </div>
     <a class="btn primary fab" href="#/expenses/new">+ Add expense</a>`;
   $('#month').addEventListener('change', (e) => {
     window._expMonth = e.target.value || thisMonth();
-    pageExpenses();
+    refresh('#/expenses', pageExpenses);
   });
   $$('[data-del]').forEach((b) => b.addEventListener('click', busy(b, async () => {
     if (!confirm('Delete this expense?')) return;
     await api('expenses/' + b.dataset.del, { method: 'DELETE' });
-    pageExpenses();
+    refresh('#/expenses', pageExpenses);
   })));
 }
 
 async function pageExpenseNew() {
-  setTop('Add expense');
+  setTop('Add expense', '', '#/expenses');
   view.innerHTML = `
-    <form id="f" class="card">
-      <label for="date">Date</label><input id="date" name="date" type="date" value="${today()}">
+    ${state.settings.ai_enabled ? `<button type="button" class="soft block" id="aiBtn">✨ Scan receipt with AI</button><div id="aiNote"></div>` : ''}
+    <form id="f" class="card" style="margin-top:14px">
+      <label for="date" style="margin-top:0">Date</label><input id="date" name="date" type="date" value="${today()}">
       <label>Type</label>
       ${seg('category', Object.fromEntries(EXPENSE_CATS.map((c) => [c, c])), 'Ads')}
       ${moneyInput('amount', '', 'Amount')}
@@ -932,36 +1316,150 @@ async function pageExpenseNew() {
       <div class="actions"><button class="primary" id="save">Save</button></div>
     </form>`;
   const f = $('#f');
+  const scanned = [];
   wireSegs(f);
   onMoneyCurrencyChange(f);
+  $('#aiBtn')?.addEventListener('click', busy($('#aiBtn'), async () => {
+    const file = await pickPhoto();
+    if (!file) return;
+    const btn = $('#aiBtn');
+    btn.innerHTML = '<span class="spinner"></span> Reading the receipt…';
+    try {
+      const r = await aiRead(file, 'expense');
+      scanned.push(file);
+      if (r.date) f.date.value = r.date;
+      if (EXPENSE_CATS.includes(r.category)) setSeg(f, 'category', r.category);
+      if (r.amount) setMoney(f, 'amount', r.amount, r.currency === 'LBP' ? 'LBP' : 'USD');
+      if (r.note) f.note.value = r.note;
+      const odd = r.currency && !['USD', 'LBP'].includes(r.currency);
+      $('#aiNote').innerHTML = `<div class="note ${odd ? '' : 'info'}">Filled from the photo. Please check it.${odd ? ` The amount looks like <b>${esc(r.currency)}</b>; change it to USD.` : ''}</div>`;
+    } finally {
+      btn.textContent = '✨ Scan another receipt';
+    }
+  }));
   f.addEventListener('submit', busy($('#save'), async () => {
     const e = await api('expenses', {
       method: 'POST',
       body: { date: f.date.value, category: f.category.value, amount_usd: round2(readMoney(f, 'amount')), note: f.note.value },
     });
-    const photos = $('#photos').files;
-    if (photos.length) await uploadReceipts(photos, { type: 'expense', id: e.id });
+    const photos = [...scanned, ...$('#photos').files];
+    if (photos.length) await uploadReceipts(photos.slice(0, 1), { type: 'expense', id: e.id });
     toast('Expense saved');
     location.hash = '#/expenses';
   }));
 }
 
+// ---------- Monthly report ----------
+
+function barsList(rows, labelKey, valueKey, fmt = (v) => v) {
+  const max = Math.max(1, ...rows.map((r) => r[valueKey]));
+  return rows.map((r) => `
+    <div style="padding:5px 0">
+      <div class="row between small"><span class="bold">${esc(r[labelKey] || '—')}</span><span class="num">${fmt(r[valueKey])}</span></div>
+      <div class="hbar"><i style="width:${Math.round((r[valueKey] / max) * 100)}%"></i></div>
+    </div>`).join('');
+}
+
+async function pageReport() {
+  const params = new URLSearchParams(location.hash.split('?')[1] || '');
+  const month = params.get('m') || window._month || thisMonth();
+  setTop('Report', `<input type="month" id="month" value="${esc(month)}" style="width:auto;padding:8px 10px" aria-label="Month">`, '#/more');
+  const here = location.hash;
+  const [r] = await Promise.all([api('report?month=' + month), loadProducts()]);
+  if (leftPage(here)) return;
+  const costs = r.cost_of_goods + r.delivery + r.expenses;
+  const slowStyles = [...new Set(r.slow_stock.map((p) => p.style))];
+  view.innerHTML = `
+    <h2 style="margin-top:4px">${esc(monthName(r.month))}</h2>
+    <div class="card stat hero">
+      <div class="label">Profit</div>
+      <div class="value num">${usd(r.profit)}</div>
+      <div class="sub">${lbp(r.profit)}</div>
+      <div class="split">
+        <span>Sales<b class="num">${usd0(r.revenue)}</b></span>
+        <span>Costs<b class="num">${usd0(costs)}</b></span>
+        <span>Orders<b class="num">${r.orders}</b></span>
+        <span>Pieces<b class="num">${r.pieces_sold}</b></span>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <table class="table">
+        <tr><td>Sales</td><td class="num">${usd(r.revenue)}</td></tr>
+        <tr><td>Real cost of pieces sold</td><td class="num">−${usd(r.cost_of_goods)}</td></tr>
+        <tr><td>Delivery fees</td><td class="num">−${usd(r.delivery)}</td></tr>
+        <tr><td>Other expenses</td><td class="num">−${usd(r.expenses)}</td></tr>
+        <tr><td class="bold">Profit</td><td class="num bold ${r.profit < 0 ? 'bad' : 'good'}">${usd(r.profit)}</td></tr>
+      </table>
+      <p class="tiny muted" style="margin:8px 0 0">Returned: ${r.returned.orders} order${r.returned.orders === 1 ? '' : 's'} (${usd(r.returned.amount)}) · Cancelled: ${r.cancelled.orders}</p>
+    </div>
+
+    <h2>By style</h2>
+    <div class="card">${r.by_style.length ? `
+      <table class="table"><tr><th></th><th>Style</th><th class="num">Pcs</th><th class="num">Sales</th><th class="num">Profit</th></tr>
+      ${r.by_style.map((s) => `<tr><td style="width:46px">${photoTag(stylePhoto(s.style), 'sm')}</td><td>${esc(s.style)}</td><td class="num">${s.pieces}</td><td class="num">${usd0(s.sales)}</td><td class="num">${usd0(s.profit)}</td></tr>`).join('')}
+      </table>` : '<div class="muted small">No sales this month.</div>'}
+    </div>
+
+    <div class="grid" style="margin-top:12px">
+      <div class="card"><h3>Best sizes</h3>${r.by_size.length ? barsList(r.by_size, 'size', 'pieces', (v) => v + ' pcs') : '<div class="muted small">—</div>'}</div>
+      <div class="card"><h3>Best colors</h3>${r.by_color.length ? barsList(r.by_color, 'color', 'pieces', (v) => v + ' pcs') : '<div class="muted small">—</div>'}</div>
+    </div>
+    <p class="tiny muted" style="margin:8px 4px 0">Use best sizes and colors to plan your next order from Turkey.</p>
+
+    <div class="grid" style="margin-top:12px">
+      <div class="card"><h3>How customers paid</h3>${r.by_payment.length ? barsList(r.by_payment.map((p) => ({ ...p, label: PAY[p.payment_method] || p.payment_method })), 'label', 'amount', usd0) : '<div class="muted small">—</div>'}</div>
+      <div class="card"><h3>Expenses</h3>${r.expenses_by_category.length ? barsList(r.expenses_by_category, 'category', 'amount', usd0) : '<div class="muted small">No expenses.</div>'}</div>
+    </div>
+
+    <h2>Stock</h2>
+    <div class="card">
+      <div class="row between"><span>Pieces on hand</span><b class="num">${r.stock.pieces}</b></div>
+      <div class="row between"><span>Worth at cost</span><b class="num">${usd(r.stock.value)}</b></div>
+      ${slowStyles.length ? `<h3 style="margin-top:14px">Not selling lately</h3>
+        <p class="small muted" style="margin:4px 0 0">No sales in the last 60 days: ${slowStyles.map((st) => `<b>${esc(st)}</b>`).join(', ')}. Maybe post them again or offer a deal.</p>` : ''}
+    </div>
+
+    <div class="actions no-print"><button class="primary" id="print">Print / save as PDF</button></div>`;
+
+  $('#month').addEventListener('change', (e) => (location.hash = '#/report?m=' + (e.target.value || thisMonth())));
+  $('#print').addEventListener('click', () => window.print());
+}
+
+// ---------- Settings ----------
+
 async function pageSettings() {
-  setTop('Settings');
+  setTop('Settings', '', '#/more');
+  const here = location.hash;
   const users = await api('users');
+  if (leftPage(here)) return;
   const isOwner = state.user.role === 'owner';
+  const st = state.settings;
   view.innerHTML = `
     <h2 style="margin-top:4px">Dollar rate</h2>
     <form id="rateF" class="card">
-      <label for="rate">1 USD = how many LBP?</label>
-      <input id="rate" name="rate" type="number" inputmode="numeric" value="${state.rate}">
+      <label for="rate" style="margin-top:0">1 USD = how many LBP?</label>
+      <input id="rate" name="rate" type="number" inputmode="numeric" value="${rate()}">
       <div class="actions"><button class="primary" id="saveRate">Save rate</button></div>
     </form>
+
+    <h2>WhatsApp message</h2>
+    <form id="waF" class="card">
+      <label for="wa" style="margin-top:0">Order confirmation text</label>
+      <textarea id="wa" name="wa" rows="6">${esc(st.wa_confirm)}</textarea>
+      <div class="hint">These words are replaced for each order: <b>{name}</b> <b>{items}</b> <b>{total}</b> <b>{area}</b></div>
+      <div class="actions"><button class="primary" id="saveWa">Save message</button></div>
+    </form>
+
+    <h2>AI reading</h2>
+    <div class="card small">${st.ai_enabled
+      ? '<span class="pill paid">On</span> Scan receipts and notebook pages from <b>+ → New shipment</b> or <b>New expense</b>.'
+      : '<span class="pill">Off</span> AI reading needs a free Gemini key. Ask the person who set up the app.'}</div>
 
     <h2>Who can get in</h2>
     <div class="card">
       ${users.map((u) => `
-        <div class="row" style="padding:6px 0">
+        <div class="row" style="padding:7px 0">
           <div class="grow">
             <div class="ellipsis"><strong>${esc(u.name || u.email)}</strong> ${u.role === 'owner' ? '<span class="pill">owner</span>' : ''} ${u.id === state.user.id ? '<span class="pill">you</span>' : ''}</div>
             <div class="small muted ellipsis">${esc(u.email)} · ${u.last_login ? 'last in ' + fmtDate(u.last_login.slice(0, 10)) : 'not signed in yet'}</div>
@@ -970,20 +1468,18 @@ async function pageSettings() {
         </div>`).join('')}
       ${isOwner ? `
       <form id="userF" style="margin-top:6px">
-        <div class="fields">
-          <div class="full"><label for="ne">Google email to allow</label><input id="ne" name="email" type="email" autocapitalize="none" autocomplete="off" placeholder="name@gmail.com" required></div>
-          <div class="full"><label for="nn">Name (optional)</label><input id="nn" name="name"></div>
-        </div>
-        <div class="actions"><button id="addUser">Allow this person</button></div>
+        <label for="ne">Google email to allow</label><input id="ne" name="email" type="email" autocapitalize="none" autocomplete="off" placeholder="name@gmail.com" required>
+        <label for="nn">Name (optional)</label><input id="nn" name="name">
+        <div class="actions"><button class="soft" id="addUser">Allow this person</button></div>
       </form>
-      <p class="small muted" style="margin-bottom:0">Removing someone signs them out right away.</p>`
+      <p class="hint">Also add them as a <b>test user</b> in Google Cloud (Audience → Test users). Removing someone signs them out right away.</p>`
       : '<p class="small muted" style="margin-bottom:0">Only the owner can add or remove people.</p>'}
     </div>
 
-    <h2>Download your data (Excel)</h2>
+    <h2>Backup (Excel)</h2>
     <div class="card">
-      <p class="small muted" style="margin-top:0">CSV files open in Excel or Google Sheets. Good as a backup.</p>
-      <div class="actions">
+      <p class="small muted" style="margin-top:0">Download your data now and then. CSV files open in Excel or Google Sheets.</p>
+      <div class="actions" style="margin-top:8px">
         <a class="btn small" href="/api/export/orders">Orders</a>
         <a class="btn small" href="/api/export/stock">Stock</a>
         <a class="btn small" href="/api/export/shipments">Shipments</a>
@@ -999,24 +1495,31 @@ async function pageSettings() {
 
     <div class="actions"><button class="danger" id="logout">Log out</button></div>`;
 
+  const saveSettings = async (body) => {
+    state.settings = await api('settings', { method: 'PUT', body });
+  };
   const rf = $('#rateF');
   rf.addEventListener('submit', busy($('#saveRate'), async () => {
-    const s = await api('settings', { method: 'PUT', body: { lbp_rate: Number(rf.rate.value) } });
-    state.rate = s.lbp_rate;
+    await saveSettings({ lbp_rate: Number(rf.rate.value) });
     toast('Rate saved');
+  }));
+  const wf = $('#waF');
+  wf.addEventListener('submit', busy($('#saveWa'), async () => {
+    await saveSettings({ wa_confirm: wf.wa.value });
+    toast('Message saved');
   }));
   if (isOwner) {
     const uf = $('#userF');
     uf.addEventListener('submit', busy($('#addUser'), async () => {
       await api('users', { method: 'POST', body: { email: uf.email.value, name: uf.name.value } });
       toast('Person allowed');
-      pageSettings();
+      refresh('#/settings', pageSettings);
     }));
     $$('[data-remove-user]').forEach((b) => b.addEventListener('click', busy(b, async () => {
       if (!confirm(`Remove ${b.dataset.email}? They will be signed out and can't get in anymore.`)) return;
       await api('users/' + b.dataset.removeUser, { method: 'DELETE' });
       toast('Removed');
-      pageSettings();
+      refresh('#/settings', pageSettings);
     })));
   }
   $('#logout').addEventListener('click', busy($('#logout'), async () => {
@@ -1032,12 +1535,10 @@ async function pageSettings() {
 async function boot() {
   const me = await api('me');
   state.user = me.user;
-  if (state.user) {
-    const s = await api('settings');
-    state.rate = s.lbp_rate;
-  }
+  if (state.user) state.settings = await api('settings');
 }
 
+$('#plusBtn').addEventListener('click', openAddSheet);
 window.addEventListener('hashchange', router);
 boot().then(router).catch(() => {
   view.innerHTML = '<div class="empty">Could not connect. Check your internet and refresh.</div>';
