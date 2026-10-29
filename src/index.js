@@ -9,6 +9,7 @@ const EARNED = ['delivered', 'paid']; // order statuses that count as sales
 const ORDER_STATUSES = ['new', 'sent', 'delivered', 'paid', 'returned', 'cancelled'];
 const PAYMENT_METHODS = ['cod', 'whish', 'omt', 'cash'];
 const MAX_RECEIPT_BYTES = 1_500_000;
+const MAX_STYLE_PHOTO_BYTES = 600_000;
 
 export default {
   async fetch(request, env) {
@@ -184,6 +185,11 @@ async function handleApi(request, env, url) {
     case 'users': return users(request, env, method, id, user);
     case 'settings': return settings(request, env, method);
     case 'products': return products(request, env, method, id);
+    case 'styles': return styles(request, env, method);
+    case 'style-photos': return stylePhotos(request, env, method, id);
+    case 'report': return report(env, url);
+    case 'customers': return customers(request, env, method, id, url);
+    case 'ai': return aiRead(request, env, method, id);
     case 'shipments': return shipments(request, env, method, id, action, user);
     case 'receipts': return receipts(request, env, method, id, user);
     case 'orders': return orders(request, env, method, id, action, user, url);
@@ -230,21 +236,42 @@ async function users(request, env, method, id, me) {
 async function settings(request, env, method) {
   if (method === 'PUT') {
     const b = await body(request);
-    const rate = num(b.lbp_rate);
-    if (rate <= 0) throw new HttpError(400, 'Rate must be more than 0');
-    await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('lbp_rate', ?)").bind(String(rate)).run();
+    const set = (key, value) => env.DB.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').bind(key, String(value));
+    const stmts = [];
+    if (b.lbp_rate !== undefined) {
+      const rate = num(b.lbp_rate);
+      if (rate <= 0) throw new HttpError(400, 'Rate must be more than 0');
+      stmts.push(set('lbp_rate', rate));
+    }
+    if (b.default_delivery_fee !== undefined) {
+      const fee = num(b.default_delivery_fee, -1);
+      if (fee < 0) throw new HttpError(400, 'Delivery fee cannot be below 0');
+      stmts.push(set('default_delivery_fee', round2(fee)));
+    }
+    for (const key of ['wa_confirm', 'wa_sent']) {
+      if (b[key] !== undefined) stmts.push(set(key, String(b[key] ?? '').slice(0, 1000)));
+    }
+    if (stmts.length) await env.DB.batch(stmts);
   }
   const { results } = await env.DB.prepare('SELECT key, value FROM settings').all();
-  const out = Object.fromEntries(results.map((r) => [r.key, r.value]));
-  out.lbp_rate = num(out.lbp_rate, 89500);
-  return json(out);
+  const s = Object.fromEntries(results.map((r) => [r.key, r.value]));
+  return json({
+    lbp_rate: num(s.lbp_rate, 89500),
+    default_delivery_fee: num(s.default_delivery_fee, 0),
+    wa_confirm: s.wa_confirm ?? '',
+    wa_sent: s.wa_sent ?? '',
+    ai_enabled: !!env.GEMINI_API_KEY,
+  });
 }
 
 // ---------- Products (stock) ----------
 
 async function products(request, env, method, id) {
   if (method === 'GET' && !id) {
-    const { results } = await env.DB.prepare('SELECT * FROM products ORDER BY style COLLATE NOCASE, color COLLATE NOCASE, size').all();
+    const { results } = await env.DB.prepare(
+      `SELECT p.*, sp.id AS photo_id, sp.updated_at AS photo_v FROM products p LEFT JOIN style_photos sp ON sp.style = p.style
+       ORDER BY p.style COLLATE NOCASE, p.color COLLATE NOCASE, p.size`
+    ).all();
     return json(results);
   }
   if (method === 'POST') {
@@ -253,8 +280,9 @@ async function products(request, env, method, id) {
     if (!style) throw new HttpError(400, 'Style name is required');
     try {
       const r = await env.DB.prepare(
-        'INSERT INTO products (style, size, color, sale_price_usd, qty, avg_cost_usd) VALUES (?, ?, ?, ?, ?, ?) RETURNING *'
-      ).bind(style, str(b.size, 30), str(b.color, 50), round2(num(b.sale_price_usd)), int(b.qty), round2(num(b.avg_cost_usd))).first();
+        'INSERT INTO products (style, size, color, sale_price_usd, qty, avg_cost_usd, code, min_price_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *'
+      ).bind(style, str(b.size, 30), str(b.color, 50), round2(num(b.sale_price_usd)), int(b.qty), round2(num(b.avg_cost_usd)),
+        str(b.code, 50), round2(Math.max(num(b.min_price_usd), 0))).first();
       return json(r);
     } catch {
       throw new HttpError(400, 'This style + size + color already exists');
@@ -266,8 +294,9 @@ async function products(request, env, method, id) {
     if (!style) throw new HttpError(400, 'Style name is required');
     try {
       const r = await env.DB.prepare(
-        'UPDATE products SET style = ?, size = ?, color = ?, sale_price_usd = ?, qty = ?, avg_cost_usd = ? WHERE id = ? RETURNING *'
-      ).bind(style, str(b.size, 30), str(b.color, 50), round2(num(b.sale_price_usd)), int(b.qty), round2(num(b.avg_cost_usd)), int(id)).first();
+        'UPDATE products SET style = ?, size = ?, color = ?, sale_price_usd = ?, qty = ?, avg_cost_usd = ?, code = ?, min_price_usd = ? WHERE id = ? RETURNING *'
+      ).bind(style, str(b.size, 30), str(b.color, 50), round2(num(b.sale_price_usd)), int(b.qty), round2(num(b.avg_cost_usd)),
+        str(b.code, 50), round2(Math.max(num(b.min_price_usd), 0)), int(id)).first();
       if (!r) throw new HttpError(404, 'Not found');
       return json(r);
     } catch (e) {
@@ -284,6 +313,42 @@ async function products(request, env, method, id) {
     return json({ ok: true });
   }
   throw new HttpError(405, 'Method not allowed');
+}
+
+// Changes every size/color of one style at once (name, code, prices)
+async function styles(request, env, method) {
+  if (method !== 'PUT') throw new HttpError(405, 'Method not allowed');
+  const b = await body(request);
+  const style = str(b.style, 100);
+  if (!style) throw new HttpError(400, 'Style name is required');
+  const sets = [];
+  const binds = [];
+  if (b.new_style !== undefined) {
+    const newStyle = str(b.new_style, 100);
+    if (!newStyle) throw new HttpError(400, 'New style name cannot be empty');
+    if (newStyle !== style) {
+      const clash = await env.DB.prepare(
+        'SELECT a.size, a.color FROM products a JOIN products b ON b.size = a.size AND b.color = a.color WHERE a.style = ? AND b.style = ? LIMIT 1'
+      ).bind(style, newStyle).first();
+      if (clash) {
+        throw new HttpError(400, `"${newStyle}" already has ${[clash.color, clash.size].filter(Boolean).join(' ') || 'the same item'}. Pick another name.`);
+      }
+    }
+    sets.push('style = ?'); binds.push(newStyle);
+  }
+  if (b.code !== undefined) { sets.push('code = ?'); binds.push(str(b.code, 50)); }
+  if (b.sale_price_usd !== undefined) { sets.push('sale_price_usd = ?'); binds.push(round2(Math.max(num(b.sale_price_usd), 0))); }
+  if (b.min_price_usd !== undefined) { sets.push('min_price_usd = ?'); binds.push(round2(Math.max(num(b.min_price_usd), 0))); }
+  if (!sets.length) return json({ updated: 0 });
+  const stmts = [env.DB.prepare(`UPDATE products SET ${sets.join(', ')} WHERE style = ?`).bind(...binds, style)];
+  const newStyle = b.new_style !== undefined ? str(b.new_style, 100) : style;
+  if (newStyle !== style) {
+    // The photo moves with the style. If the new name already has a photo, keep that one.
+    stmts.push(env.DB.prepare('UPDATE style_photos SET style = ? WHERE style = ? AND NOT EXISTS (SELECT 1 FROM style_photos WHERE style = ?)').bind(newStyle, style, newStyle));
+    stmts.push(env.DB.prepare('DELETE FROM style_photos WHERE style = ?').bind(style));
+  }
+  const [r] = await env.DB.batch(stmts);
+  return json({ updated: r.meta.changes });
 }
 
 // Finds a product by style/size/color, or creates it. Returns its id.
@@ -437,7 +502,9 @@ async function orderWithItems(env, id) {
   const o = await env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(id).first();
   if (!o) throw new HttpError(404, 'Order not found');
   const { results: items } = await env.DB.prepare(
-    'SELECT oi.*, p.style, p.size, p.color FROM order_items oi JOIN products p ON p.id = oi.product_id WHERE oi.order_id = ? ORDER BY oi.id'
+    `SELECT oi.*, p.style, p.size, p.color, sp.id AS photo_id, sp.updated_at AS photo_v
+     FROM order_items oi JOIN products p ON p.id = oi.product_id LEFT JOIN style_photos sp ON sp.style = p.style
+     WHERE oi.order_id = ? ORDER BY oi.id`
   ).bind(id).all();
   return { ...o, items };
 }
@@ -468,6 +535,32 @@ function orderFields(b) {
     round2(num(b.total_usd)), round2(num(b.delivery_cost_usd)), str(b.notes, 1000)];
 }
 
+// Lebanese mobile to "961" + number: "03 123 456", "+961 3 123456" and "3123456" all become "9613123456".
+// Anything that is not a Lebanese mobile is kept as its digits, so it still matches itself.
+export function normalizePhone(v) {
+  const digits = String(v ?? '').replace(/\D/g, '');
+  let d = digits;
+  if (d.startsWith('00')) d = d.slice(2);
+  if (d.startsWith('961')) d = d.slice(3);
+  if (d.startsWith('0')) d = d.slice(1);
+  if ((d.length === 7 && d.startsWith('3')) || (d.length === 8 && /^(70|71|76|78|79|81)/.test(d))) return '961' + d;
+  return digits;
+}
+
+// Statements that save the order's customer (by phone) and link it to the order.
+// fields comes from orderFields(): [date, name, phone, area, ...]
+function linkCustomer(env, orderId, fields) {
+  const phone = normalizePhone(fields[2]);
+  if (!phone) return [env.DB.prepare('UPDATE orders SET customer_id = NULL WHERE id = ?').bind(orderId)];
+  return [
+    env.DB.prepare(`INSERT INTO customers (name, phone, area) VALUES (?, ?, ?)
+      ON CONFLICT (phone) WHERE phone != '' DO UPDATE SET
+        name = CASE WHEN excluded.name != '' THEN excluded.name ELSE customers.name END,
+        area = CASE WHEN excluded.area != '' THEN excluded.area ELSE customers.area END`).bind(fields[1], phone, fields[3]),
+    env.DB.prepare('UPDATE orders SET customer_id = (SELECT id FROM customers WHERE phone = ?) WHERE id = ?').bind(phone, orderId),
+  ];
+}
+
 async function orders(request, env, method, id, action, user, url) {
   if (method === 'GET' && !id) {
     const status = url.searchParams.get('status');
@@ -496,6 +589,7 @@ async function orders(request, env, method, id, action, user, url) {
     const stmts = items.map((it) => env.DB.prepare('INSERT INTO order_items (order_id, product_id, qty, unit_price_usd, unit_cost_usd) VALUES (?, ?, ?, ?, ?)')
       .bind(o.id, it.product_id, it.qty, it.unit_price_usd, it.unit_cost_usd));
     if (COUNTED.includes(fields[5])) stmts.push(...stockMoves(env, items, -1));
+    stmts.push(...linkCustomer(env, o.id, fields));
     await env.DB.batch(stmts);
     return json(await orderWithItems(env, o.id));
   }
@@ -534,6 +628,7 @@ async function orders(request, env, method, id, action, user, url) {
         .bind(oid, it.product_id, it.qty, it.unit_price_usd, it.unit_cost_usd));
     }
     if (COUNTED.includes(fields[5])) stmts.push(...stockMoves(env, items, -1));
+    stmts.push(...linkCustomer(env, oid, fields));
     await env.DB.batch(stmts);
     return json(await orderWithItems(env, oid));
   }
@@ -547,6 +642,293 @@ async function orders(request, env, method, id, action, user, url) {
     return json({ ok: true });
   }
   throw new HttpError(405, 'Method not allowed');
+}
+
+// ---------- Style photos ----------
+
+async function stylePhotos(request, env, method, id) {
+  if (method === 'POST' && !id) {
+    const form = await request.formData();
+    const style = str(form.get('style'), 100);
+    if (!style) throw new HttpError(400, 'Style name is required');
+    const file = form.get('file');
+    if (!file || typeof file === 'string') throw new HttpError(400, 'No photo');
+    if (!/^image\//.test(file.type)) throw new HttpError(400, 'Only photos are allowed');
+    const data = await file.arrayBuffer();
+    if (data.byteLength > MAX_STYLE_PHOTO_BYTES) throw new HttpError(400, 'Photo is too big');
+    // updated_at has milliseconds so a replaced photo always gets a new version
+    const r = await env.DB.prepare(
+      `INSERT INTO style_photos (style, mime, data, updated_at) VALUES (?, ?, ?, strftime('%Y-%m-%d %H:%M:%f', 'now'))
+       ON CONFLICT (style) DO UPDATE SET mime = excluded.mime, data = excluded.data, updated_at = excluded.updated_at
+       RETURNING id, updated_at`
+    ).bind(style, file.type, data).first();
+    return json({ id: r.id, v: r.updated_at });
+  }
+  if (method === 'GET' && id) {
+    const r = await env.DB.prepare('SELECT mime, data FROM style_photos WHERE id = ?').bind(int(id)).first();
+    if (!r) throw new HttpError(404, 'Not found');
+    return new Response(new Uint8Array(r.data), { headers: { 'content-type': r.mime, 'cache-control': 'private, max-age=86400' } });
+  }
+  if (method === 'DELETE' && id) {
+    await env.DB.prepare('DELETE FROM style_photos WHERE id = ?').bind(int(id)).run();
+    return json({ ok: true });
+  }
+  throw new HttpError(405, 'Method not allowed');
+}
+
+// ---------- Monthly report ----------
+
+async function report(env, url) {
+  const month = /^\d{4}-\d{2}$/.test(url.searchParams.get('month') || '') ? url.searchParams.get('month') : today().slice(0, 7);
+  const earned = EARNED.map((s) => `'${s}'`).join(',');
+  const [y, m] = month.split('-').map(Number);
+  const monthEnd = new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10);
+  const inMonth = 'substr(o.date, 1, 7) = ?';
+  const itemsInMonth = `FROM order_items oi JOIN orders o ON o.id = oi.order_id JOIN products p ON p.id = oi.product_id
+    WHERE o.status IN (${earned}) AND ${inMonth}`;
+
+  const [sales, cogs, exp, returned, cancelled, byStyle, bySize, byColor, byPayment, expByCat, stock, slow] = await env.DB.batch([
+    env.DB.prepare(`SELECT COUNT(*) AS orders, COALESCE(SUM(total_usd), 0) AS revenue, COALESCE(SUM(delivery_cost_usd), 0) AS delivery
+      FROM orders o WHERE o.status IN (${earned}) AND ${inMonth}`).bind(month),
+    env.DB.prepare(`SELECT COALESCE(SUM(oi.qty * oi.unit_cost_usd), 0) AS cogs, COALESCE(SUM(oi.qty), 0) AS pieces ${itemsInMonth}`).bind(month),
+    env.DB.prepare('SELECT COALESCE(SUM(amount_usd), 0) AS total FROM expenses WHERE substr(date, 1, 7) = ?').bind(month),
+    env.DB.prepare(`SELECT COUNT(*) AS orders, COALESCE(SUM(total_usd), 0) AS amount FROM orders o WHERE o.status = 'returned' AND ${inMonth}`).bind(month),
+    env.DB.prepare(`SELECT COUNT(*) AS orders FROM orders o WHERE o.status = 'cancelled' AND ${inMonth}`).bind(month),
+    env.DB.prepare(`SELECT p.style, SUM(oi.qty) AS pieces, SUM(oi.qty * oi.unit_price_usd) AS sales, SUM(oi.qty * (oi.unit_price_usd - oi.unit_cost_usd)) AS profit
+      ${itemsInMonth} GROUP BY p.style ORDER BY pieces DESC, sales DESC`).bind(month),
+    env.DB.prepare(`SELECT p.size, SUM(oi.qty) AS pieces ${itemsInMonth} GROUP BY p.size ORDER BY pieces DESC`).bind(month),
+    env.DB.prepare(`SELECT p.color, SUM(oi.qty) AS pieces ${itemsInMonth} GROUP BY p.color ORDER BY pieces DESC`).bind(month),
+    env.DB.prepare(`SELECT payment_method, COUNT(*) AS orders, SUM(total_usd) AS amount FROM orders o
+      WHERE o.status IN (${earned}) AND ${inMonth} GROUP BY payment_method ORDER BY amount DESC`).bind(month),
+    env.DB.prepare(`SELECT category, SUM(amount_usd) AS amount FROM expenses WHERE substr(date, 1, 7) = ? GROUP BY category ORDER BY amount DESC`).bind(month),
+    env.DB.prepare('SELECT COALESCE(SUM(qty), 0) AS pieces, COALESCE(SUM(qty * avg_cost_usd), 0) AS value FROM products WHERE qty > 0'),
+    // In stock, but nothing sold in the 60 days up to the end of this month
+    env.DB.prepare(`SELECT p.style, p.color, p.size, p.qty FROM products p WHERE p.qty > 0 AND NOT EXISTS (
+        SELECT 1 FROM order_items oi JOIN orders o ON o.id = oi.order_id
+        WHERE oi.product_id = p.id AND o.status IN (${earned}) AND o.date > date(?, '-60 days') AND o.date <= ?)
+      ORDER BY p.qty DESC, p.style, p.color, p.size LIMIT 20`).bind(monthEnd, monthEnd),
+  ]);
+
+  const s = sales.results[0];
+  const c = cogs.results[0];
+  const e = exp.results[0].total;
+  const money = (rows, ...keys) => rows.results.map((r) => ({ ...r, ...Object.fromEntries(keys.map((k) => [k, round2(r[k])])) }));
+  return json({
+    month,
+    revenue: round2(s.revenue),
+    cost_of_goods: round2(c.cogs),
+    delivery: round2(s.delivery),
+    expenses: round2(e),
+    profit: round2(s.revenue - c.cogs - s.delivery - e),
+    orders: s.orders,
+    pieces_sold: c.pieces,
+    returned: { orders: returned.results[0].orders, amount: round2(returned.results[0].amount) },
+    cancelled: { orders: cancelled.results[0].orders },
+    by_style: money(byStyle, 'sales', 'profit'),
+    by_size: bySize.results,
+    by_color: byColor.results,
+    by_payment: money(byPayment, 'amount'),
+    expenses_by_category: money(expByCat, 'amount'),
+    stock: { pieces: stock.results[0].pieces, value: round2(stock.results[0].value) },
+    slow_stock: slow.results,
+  });
+}
+
+// ---------- Customers ----------
+
+const ORDER_SUMMARY = `(SELECT GROUP_CONCAT(oi.qty || 'x ' || p.style || CASE WHEN p.size != '' THEN ' ' || p.size ELSE '' END || CASE WHEN p.color != '' THEN ' ' || p.color ELSE '' END, ', ')
+  FROM order_items oi JOIN products p ON p.id = oi.product_id WHERE oi.order_id = o.id)`;
+
+async function customers(request, env, method, id, url) {
+  if (method === 'GET' && !id) {
+    const q = str(url.searchParams.get('q'), 100);
+    let sql = `SELECT c.id, c.name, c.phone, c.area, c.notes,
+        (SELECT COUNT(*) FROM orders o WHERE o.customer_id = c.id) AS orders_count,
+        COALESCE((SELECT SUM(total_usd) FROM orders o WHERE o.customer_id = c.id AND o.status NOT IN ('cancelled', 'returned')), 0) AS total_spent,
+        (SELECT MAX(date) FROM orders o WHERE o.customer_id = c.id) AS last_order_date
+      FROM customers c`;
+    const binds = [];
+    if (q) { sql += ' WHERE c.name LIKE ? OR c.phone LIKE ? OR c.area LIKE ?'; binds.push(`%${q}%`, `%${q}%`, `%${q}%`); }
+    sql += ' ORDER BY last_order_date IS NULL, last_order_date DESC, c.name COLLATE NOCASE LIMIT 300';
+    const { results } = await env.DB.prepare(sql).bind(...binds).all();
+    return json(results.map((r) => ({ ...r, total_spent: round2(r.total_spent) })));
+  }
+
+  const cid = int(id);
+  const c = await env.DB.prepare('SELECT * FROM customers WHERE id = ?').bind(cid).first();
+  if (!c) throw new HttpError(404, 'Customer not found');
+
+  if (method === 'GET') {
+    const { results } = await env.DB.prepare(
+      `SELECT o.id, o.date, o.status, o.payment_method, o.total_usd, ${ORDER_SUMMARY} AS summary FROM orders o WHERE o.customer_id = ? ORDER BY o.date DESC, o.id DESC`
+    ).bind(cid).all();
+    return json({ ...c, orders: results });
+  }
+  if (method === 'PUT') {
+    const b = await body(request);
+    const phone = normalizePhone(b.phone);
+    try {
+      await env.DB.prepare('UPDATE customers SET name = ?, phone = ?, area = ?, notes = ? WHERE id = ?')
+        .bind(str(b.name, 100), phone, str(b.area, 100), str(b.notes, 1000), cid).run();
+    } catch {
+      throw new HttpError(400, 'Another customer already has this phone number');
+    }
+    return json(await env.DB.prepare('SELECT * FROM customers WHERE id = ?').bind(cid).first());
+  }
+  if (method === 'DELETE') {
+    await env.DB.batch([
+      env.DB.prepare('UPDATE orders SET customer_id = NULL WHERE customer_id = ?').bind(cid),
+      env.DB.prepare('DELETE FROM customers WHERE id = ?').bind(cid),
+    ]);
+    return json({ ok: true });
+  }
+  throw new HttpError(405, 'Method not allowed');
+}
+
+// ---------- AI reading (receipts, invoices, notebook pages) ----------
+
+const EXPENSE_CATEGORIES = ['Ads', 'Packaging', 'Delivery', 'Phone / internet', 'Other'];
+
+const AI_SCHEMAS = {
+  shipment: {
+    type: 'OBJECT',
+    properties: {
+      supplier: { type: 'STRING' },
+      date: { type: 'STRING' },
+      currency: { type: 'STRING' },
+      items: {
+        type: 'ARRAY',
+        items: {
+          type: 'OBJECT',
+          properties: {
+            style: { type: 'STRING' }, code: { type: 'STRING' }, color: { type: 'STRING' },
+            size: { type: 'STRING' }, qty: { type: 'INTEGER' }, unit_cost: { type: 'NUMBER' },
+          },
+          required: ['style', 'code', 'color', 'size', 'qty', 'unit_cost'],
+        },
+      },
+      shipping: { type: 'NUMBER' },
+      customs: { type: 'NUMBER' },
+      other: { type: 'NUMBER' },
+      notes: { type: 'STRING' },
+    },
+    required: ['supplier', 'date', 'currency', 'items', 'shipping', 'customs', 'other', 'notes'],
+  },
+  expense: {
+    type: 'OBJECT',
+    properties: {
+      date: { type: 'STRING' },
+      amount: { type: 'NUMBER' },
+      currency: { type: 'STRING' },
+      category: { type: 'STRING', enum: EXPENSE_CATEGORIES },
+      note: { type: 'STRING' },
+    },
+    required: ['date', 'amount', 'currency', 'category', 'note'],
+  },
+};
+
+const AI_PROMPTS = {
+  shipment: `You read photos for a small online pajama shop in Lebanon that buys stock from Turkey.
+The photo is either a printed receipt/invoice from a supplier or shipping company, or a handwritten notebook page written by the shop owner.
+
+Handwritten notebook format (example):
+"23522 / Smile" = supplier style code(s) and the style name. Several codes can be listed, like "22119 / 22125 / Snowman". Put the codes in "code" and the name in "style".
+"Teal -> S, M, M, L, L, XL" = color Teal with quantities per size: S 1, M 2, L 2, XL 1. Count repeated sizes.
+A crossed-out size is already sold: skip it.
+"wholesale price 8.50$" = unit_cost per piece for that style.
+"+ shipping 3.79$" in the notebook is shipping PER PIECE. Total shipping = per-piece shipping x number of pieces of that style. Add these up over all styles and return the TOTAL in "shipping".
+"Selling price" lines are NOT costs. Put them in "notes" (for example "Smile sells at $25, minimum $23").
+Lines like "= 11.79" are the owner's own sums: ignore them.
+
+Return one item per style + color + size with its qty.
+For a printed receipt, read supplier, date, items, quantities, unit prices, shipping, customs and other fees.
+date must be YYYY-MM-DD, or "" if not shown. currency is a code like USD, LBP or TRY.
+Never invent numbers. Use 0 or "" when something is not shown.`,
+  expense: `You read a receipt photo for a small online pajama shop in Lebanon.
+Return the date (YYYY-MM-DD, or "" if not shown), the total amount paid, the currency code (USD, LBP, TRY...),
+the best category (Ads, Packaging, Delivery, Phone / internet, Other) and a short note saying what it was for.
+Never invent numbers. Use 0 or "" when something is not shown.`,
+};
+
+function toBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
+const cleanDate = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v ?? '')) ? String(v) : '');
+const cleanCurrency = (v) => (str(v, 10).toUpperCase().replace(/[^A-Z]/g, '') || 'USD');
+const nonNeg = (v) => round2(Math.max(num(v), 0));
+
+function cleanAiResult(kind, r) {
+  r = r && typeof r === 'object' ? r : {};
+  if (kind === 'expense') {
+    return {
+      date: cleanDate(r.date),
+      amount: nonNeg(r.amount),
+      currency: cleanCurrency(r.currency),
+      category: EXPENSE_CATEGORIES.includes(r.category) ? r.category : 'Other',
+      note: str(r.note, 500),
+    };
+  }
+  const items = (Array.isArray(r.items) ? r.items : [])
+    .map((it) => ({
+      style: str(it?.style, 100),
+      code: str(it?.code, 50),
+      color: str(it?.color, 50),
+      size: str(it?.size, 30),
+      qty: Math.max(int(it?.qty), 0),
+      unit_cost: nonNeg(it?.unit_cost),
+    }))
+    .filter((it) => it.style && it.qty > 0);
+  return {
+    supplier: str(r.supplier, 100),
+    date: cleanDate(r.date),
+    currency: cleanCurrency(r.currency),
+    items,
+    shipping: nonNeg(r.shipping),
+    customs: nonNeg(r.customs),
+    other: nonNeg(r.other),
+    notes: str(r.notes, 1000),
+  };
+}
+
+async function aiRead(request, env, method, action) {
+  if (method !== 'POST' || action !== 'read') throw new HttpError(404, 'Not found');
+  if (!env.GEMINI_API_KEY) throw new HttpError(400, 'AI reading is not set up yet');
+  const form = await request.formData();
+  const kind = form.get('kind');
+  if (!AI_SCHEMAS[kind]) throw new HttpError(400, 'Unknown kind');
+  const file = form.get('file');
+  if (!file || typeof file === 'string') throw new HttpError(400, 'No photo');
+  if (!/^image\//.test(file.type)) throw new HttpError(400, 'Only photos are allowed');
+  const data = await file.arrayBuffer();
+  if (data.byteLength > MAX_RECEIPT_BYTES) throw new HttpError(400, 'Photo is too big');
+
+  const failed = 'AI could not read this photo. Try a clearer photo or type it in.';
+  const payload = JSON.stringify({
+    contents: [{ parts: [{ text: AI_PROMPTS[kind] }, { inline_data: { mime_type: file.type, data: toBase64(data) } }] }],
+    generationConfig: { responseMimeType: 'application/json', responseSchema: AI_SCHEMAS[kind], temperature: 0 },
+  });
+  const ask = (model) => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
+    body: payload,
+  });
+  let res = await ask(env.GEMINI_MODEL || 'gemini-3-flash-preview');
+  // Preview models come and go; fall back to the stable one if the model is gone
+  if (res.status === 404) res = await ask('gemini-2.5-flash');
+  if (res.status === 429) throw new HttpError(429, 'The free AI limit is reached for now. Try again later or type it in.');
+  if (!res.ok) throw new HttpError(502, failed);
+  let parsed;
+  try {
+    const out = await res.json();
+    parsed = JSON.parse(out.candidates[0].content.parts[0].text);
+  } catch {
+    throw new HttpError(502, failed);
+  }
+  return json({ kind, result: cleanAiResult(kind, parsed) });
 }
 
 // ---------- Expenses ----------
