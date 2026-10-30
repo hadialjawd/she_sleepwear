@@ -312,6 +312,17 @@ textarea { min-height: 76px; resize: vertical; }
 .order-card .btns { display: flex; gap: 8px; margin-top: 12px; }
 .order-card .btns > * { flex: 1; }
 
+/* ---------- Insights ---------- */
+.hrow { display: flex; gap: 10px; align-items: center; padding: 7px 0; }
+.hrow .rank { width: 24px; height: 24px; border-radius: 50%; background: var(--blush-2); color: var(--brand); font: 800 12px var(--sans); display: grid; place-items: center; flex: none; }
+.card h3 { margin-bottom: 6px; }
+.ins-totals { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.ins-totals .card { padding: 12px; }
+.ins-totals .stat .value { font-size: 20px; }
+.ins-pair { display: grid; grid-template-columns: 1fr; gap: 12px; }
+.ins-pair .card + .card { margin-top: 0; }
+@media (min-width: 640px) { .ins-pair { grid-template-columns: 1fr 1fr; } }
+
 /* ---------- Assistant chat ---------- */
 .chat-log { display: flex; flex-direction: column; gap: 10px; padding-bottom: 150px; }
 .bubble { max-width: 86%; padding: 11px 14px; border-radius: 18px; white-space: pre-wrap; line-height: 1.45; font-size: 15px; }
