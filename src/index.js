@@ -188,6 +188,7 @@ async function handleApi(request, env, url) {
     case 'styles': return styles(request, env, method);
     case 'style-photos': return stylePhotos(request, env, method, id);
     case 'report': return report(env, url);
+    case 'insights': return insights(env, url);
     case 'customers': return customers(request, env, method, id, url);
     case 'ai': return aiRead(request, env, method, id);
     case 'assistant': return assistant(request, env, method);
@@ -678,6 +679,44 @@ async function stylePhotos(request, env, method, id) {
 }
 
 // ---------- Monthly report ----------
+
+// ---------- Insights (dashboard charts with filters) ----------
+// Profit here is per piece: selling price - real cost. Delivery fees and expenses are not included.
+
+async function insights(env, url) {
+  const p = url.searchParams;
+  const isDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(v || '');
+  const to = isDate(p.get('to')) ? p.get('to') : today();
+  const from = isDate(p.get('from')) ? p.get('from') : '0000-01-01';
+  const style = str(p.get('style'), 100);
+  const payment = PAYMENT_METHODS.includes(p.get('payment')) ? p.get('payment') : '';
+  // Group by day for short periods, by month for long ones
+  const days = from === '0000-01-01' ? 9999 : (Date.parse(to) - Date.parse(from)) / 86400000;
+  const bucket = days <= 62 ? 'day' : 'month';
+  const bucketExpr = bucket === 'day' ? 'o.date' : 'substr(o.date, 1, 7)';
+
+  const where = `o.status IN (${EARNED.map((e) => `'${e}'`).join(',')}) AND o.date BETWEEN ? AND ?`
+    + (style ? ' AND p.style = ?' : '') + (payment ? ' AND o.payment_method = ?' : '');
+  const binds = [from, to, ...(style ? [style] : []), ...(payment ? [payment] : [])];
+  const base = `FROM order_items oi JOIN orders o ON o.id = oi.order_id JOIN products p ON p.id = oi.product_id WHERE ${where}`;
+  const sums = `SUM(oi.qty) AS pieces, ROUND(SUM(oi.qty * oi.unit_price_usd), 2) AS sales, ROUND(SUM(oi.qty * (oi.unit_price_usd - oi.unit_cost_usd)), 2) AS profit`;
+
+  const [totals, byStyle, byColor, bySize, overTime, styles] = await env.DB.batch([
+    env.DB.prepare(`SELECT COUNT(DISTINCT o.id) AS orders, ${sums} ${base}`).bind(...binds),
+    env.DB.prepare(`SELECT p.style AS label, ${sums} ${base} GROUP BY p.style ORDER BY pieces DESC`).bind(...binds),
+    env.DB.prepare(`SELECT p.color AS label, ${sums} ${base} GROUP BY p.color ORDER BY pieces DESC`).bind(...binds),
+    env.DB.prepare(`SELECT p.size AS label, ${sums} ${base} GROUP BY p.size ORDER BY pieces DESC`).bind(...binds),
+    env.DB.prepare(`SELECT ${bucketExpr} AS label, ${sums} ${base} GROUP BY label ORDER BY label`).bind(...binds),
+    env.DB.prepare('SELECT DISTINCT style FROM products ORDER BY style COLLATE NOCASE'),
+  ]);
+  const t = totals.results[0];
+  return json({
+    from: from === '0000-01-01' ? null : from, to, style, payment, bucket,
+    totals: { orders: t.orders || 0, pieces: t.pieces || 0, sales: t.sales || 0, profit: t.profit || 0 },
+    by_style: byStyle.results, by_color: byColor.results, by_size: bySize.results, over_time: overTime.results,
+    styles: styles.results.map((r) => r.style),
+  });
+}
 
 async function report(env, url) {
   const month = /^\d{4}-\d{2}$/.test(url.searchParams.get('month') || '') ? url.searchParams.get('month') : today().slice(0, 7);
