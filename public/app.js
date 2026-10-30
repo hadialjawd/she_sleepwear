@@ -451,14 +451,9 @@ async function pageHome() {
       <p class="tiny muted" style="margin:10px 0 0">Profit per month. Red means a loss.</p>
     </div>
 
-    <h2 class="section-link">Best sellers <a href="#/report?m=${esc(d.month)}">Full report ›</a></h2>
-    <div class="card">${d.best_sellers.length ? d.best_sellers.map((b) => `
-      <div class="row" style="padding:6px 0">
-        ${photoTag(stylePhoto(b.style), 'sm')}
-        <div class="grow"><div class="bold ellipsis">${esc(b.style)}</div><div class="tiny muted">${b.pieces} pieces</div></div>
-        <div class="num bold">${usd0(b.sales)}</div>
-      </div>`).join('') : '<div class="muted small">No sales yet this month.</div>'}
-    </div>
+    <h2 class="section-link">Best sellers <a href="#/report?m=${esc(d.month)}">Monthly report ›</a></h2>
+    <div id="insFilters"></div>
+    <div id="ins"><p class="muted center pad">Loading…</p></div>
 
     <h2>Sold out</h2>
     <div class="card">${soldOut.length ? soldOut.map((p) => `
@@ -472,6 +467,115 @@ async function pageHome() {
   $('#month').addEventListener('change', (e) => {
     window._month = e.target.value || thisMonth();
     refresh('#/', pageHome);
+  });
+  setupInsights();
+}
+
+// ---------- Insights: best sellers charts with filters ----------
+
+const PERIODS = { month: 'This month', last: 'Last month', '3m': '3 months', year: 'This year', all: 'All time' };
+const METRICS = { pieces: 'Pieces', sales: 'Sales $', profit: 'Profit $' };
+const ins = { period: 'month', style: '', payment: '', metric: 'pieces' };
+
+function periodRange(key) {
+  const now = new Date();
+  const ymd = (d) => d.toLocaleDateString('en-CA');
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  if (key === 'month') return { from: ymd(new Date(y, m, 1)), to: ymd(now) };
+  if (key === 'last') return { from: ymd(new Date(y, m - 1, 1)), to: ymd(new Date(y, m, 0)) };
+  if (key === '3m') return { from: ymd(new Date(y, m - 2, 1)), to: ymd(now) };
+  if (key === 'year') return { from: ymd(new Date(y, 0, 1)), to: ymd(now) };
+  return { from: '', to: ymd(now) };
+}
+
+const metricFmt = (v) => (ins.metric === 'pieces' ? `${v || 0} pcs` : usd0(v));
+
+function hbarChart(rows, { photos = false, empty = '—' } = {}) {
+  if (!rows.length) return `<div class="muted small">${empty}</div>`;
+  const max = Math.max(1, ...rows.map((r) => Math.abs(r[ins.metric] || 0)));
+  return rows.map((r, i) => `
+    <div class="hrow">
+      ${photos ? photoTag(stylePhoto(r.label), 'sm') : `<span class="rank">${i + 1}</span>`}
+      <div class="grow">
+        <div class="row between small"><span class="bold ellipsis">${esc(r.label || '—')}</span><span class="num bold">${metricFmt(r[ins.metric])}</span></div>
+        <div class="hbar"><i style="width:${Math.max(2, Math.round((Math.abs(r[ins.metric] || 0) / max) * 100))}%"></i></div>
+        <div class="tiny muted">${r.pieces} pcs · ${usd0(r.sales)} sales · ${usd0(r.profit)} profit</div>
+      </div>
+    </div>`).join('');
+}
+
+function timeChart(rows, bucket) {
+  if (!rows.length) return '<div class="muted small">No sales in this period.</div>';
+  const max = Math.max(1, ...rows.map((r) => r[ins.metric] || 0));
+  const label = (l) => (bucket === 'day' ? fmtDate(l) : monthShort(l));
+  const shown = rows.slice(-14);
+  return `<div class="bars">${shown.map((r) => `
+    <div class="b" title="${esc(r.label)}: ${metricFmt(r[ins.metric])}">
+      <span class="v">${ins.metric === 'pieces' ? r.pieces : usd0(r[ins.metric])}</span>
+      <div class="bar cur" style="height:${Math.round(((r[ins.metric] || 0) / max) * 80)}%"></div>
+      <span class="m">${esc(label(r.label))}</span>
+    </div>`).join('')}</div>
+    <p class="tiny muted" style="margin:6px 0 0">${bucket === 'day' ? 'Days with sales' : 'By month'}${rows.length > shown.length ? ` (last ${shown.length})` : ''}.</p>`;
+}
+
+async function setupInsights() {
+  const box = $('#ins');
+  const filters = $('#insFilters');
+  if (!box) return;
+  const here = location.hash;
+  const { from, to } = periodRange(ins.period);
+  const qs = new URLSearchParams({ to });
+  if (from) qs.set('from', from);
+  if (ins.style) qs.set('style', ins.style);
+  if (ins.payment) qs.set('payment', ins.payment);
+  let r;
+  try {
+    r = await api('insights?' + qs);
+  } catch (err) {
+    box.innerHTML = `<div class="note bad">${esc(err.message)}</div>`;
+    return;
+  }
+  if (leftPage(here) || !$('#ins')) return;
+
+  filters.innerHTML = `
+    <div class="chips" id="insPeriod">${Object.entries(PERIODS).map(([k, v]) => `<button data-p="${k}" class="${k === ins.period ? 'on' : ''}">${v}</button>`).join('')}</div>
+    <div class="fields" style="margin-bottom:10px">
+      <div><select id="insStyle" aria-label="Style"><option value="">All styles</option>${r.styles.map((s) => `<option ${s === ins.style ? 'selected' : ''}>${esc(s)}</option>`).join('')}</select></div>
+      <div><select id="insPay" aria-label="Payment"><option value="">All payments</option>${Object.entries(PAY).map(([k, v]) => `<option value="${k}" ${k === ins.payment ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select></div>
+    </div>
+    ${seg('insMetric', METRICS, ins.metric)}`;
+
+  const t = r.totals;
+  box.innerHTML = `
+    <div class="ins-totals" style="margin-top:12px">
+      <div class="card stat"><div class="label">Pieces sold</div><div class="value num">${t.pieces}</div><div class="sub">${t.orders} order${t.orders === 1 ? '' : 's'}</div></div>
+      <div class="card stat"><div class="label">Sales</div><div class="value num">${usd0(t.sales)}</div></div>
+      <div class="card stat"><div class="label">Profit</div><div class="value num ${t.profit < 0 ? 'bad' : 'good'}">${usd0(t.profit)}</div></div>
+    </div>
+    <p class="tiny muted" style="margin:6px 4px 0">Profit here = selling price − real cost of the pieces, before delivery fees and expenses.</p>
+    <div class="card" style="margin-top:12px"><h3>Over time</h3>${timeChart(r.over_time, r.bucket)}</div>
+    ${ins.style ? '' : `<div class="card" style="margin-top:12px"><h3>Best styles</h3>${hbarChart(r.by_style, { photos: true, empty: 'No sales in this period.' })}</div>`}
+    <div class="ins-pair" style="margin-top:12px">
+      <div class="card"><h3>Best colors</h3>${hbarChart(r.by_color)}</div>
+      <div class="card"><h3>Best sizes</h3>${hbarChart(r.by_size)}</div>
+    </div>`;
+
+  $$('#insPeriod button').forEach((b) => b.addEventListener('click', () => {
+    ins.period = b.dataset.p;
+    setupInsights();
+  }));
+  $('#insStyle').addEventListener('change', (e) => {
+    ins.style = e.target.value;
+    setupInsights();
+  });
+  $('#insPay').addEventListener('change', (e) => {
+    ins.payment = e.target.value;
+    setupInsights();
+  });
+  wireSegs(filters, (_, v) => {
+    ins.metric = v;
+    setupInsights();
   });
 }
 
