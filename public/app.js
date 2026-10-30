@@ -260,6 +260,41 @@ function openWhatsApp(order) {
   window.open(link, '_blank', 'noopener');
 }
 
+// ---------- Install as an app ----------
+
+let installPrompt = null;
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  installPrompt = e;
+  $$('.install-btn').forEach((b) => (b.hidden = false));
+});
+window.addEventListener('appinstalled', () => {
+  installPrompt = null;
+  $$('.install-btn').forEach((b) => (b.hidden = true));
+  toast('App installed 🎉');
+});
+const isInstalled = () => window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const isIos = () => /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const installBtn = (cls = 'soft small') => (isInstalled() ? '' : `<button type="button" class="${cls} install-btn">📲 Install app</button>`);
+
+async function installApp() {
+  if (installPrompt) {
+    installPrompt.prompt();
+    await installPrompt.userChoice.catch(() => {});
+    installPrompt = null;
+    return;
+  }
+  const steps = isIos()
+    ? '<ol class="steps"><li>Open this page in <b>Safari</b>.</li><li>Tap the <b>Share</b> button <span aria-hidden="true">⬆️</span> at the bottom.</li><li>Tap <b>Add to Home Screen</b>, then <b>Add</b>.</li></ol>'
+    : '<ol class="steps"><li>Open the browser menu <b>⋮</b> (top right).</li><li>Tap <b>Install app</b> or <b>Add to Home screen</b>.</li><li>Tap <b>Install</b>.</li></ol>';
+  const s = openSheet(`<h2>Install She Sleepwear</h2>${steps}<p class="small muted">The app opens full screen from your home screen, like a normal app.</p><div class="actions"><button class="primary" id="instOk">Got it</button></div>`);
+  $('#instOk', s).addEventListener('click', closeSheet);
+}
+document.addEventListener('click', (e) => {
+  if (e.target.closest('.install-btn')) installApp();
+});
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+
 // ---------- Router ----------
 
 const routes = [
@@ -351,6 +386,7 @@ async function pageLogin() {
       <img class="logo" src="/icon.svg" alt="">
       <h1 class="center">She Sleepwear</h1>
       <p class="muted center">Your shop, stock and profit in one place.</p>
+      <div class="center" style="margin-bottom:12px">${installBtn()}</div>
       <div class="card center">
         <div id="gbtn" style="display:flex;justify-content:center;min-height:44px"></div>
         <p class="small muted" style="margin:12px 0 0">Only people the owner added can get in.</p>
@@ -392,7 +428,7 @@ function greeting() {
 
 async function pageHome() {
   const month = window._month || thisMonth();
-  setTop('She Sleepwear');
+  setTop('She Sleepwear', installBtn());
   const here = location.hash;
   const [d] = await Promise.all([api('dashboard?month=' + month), loadProducts()]);
   if (leftPage(here)) return;
@@ -402,7 +438,7 @@ async function pageHome() {
 
   view.innerHTML = `
     <div class="greet"><span>${esc(greeting())} 🌙</span><input type="month" id="month" value="${esc(month)}" aria-label="Month"></div>
-    ${state.settings.ai_enabled ? '<a class="btn soft block" href="#/assistant" style="margin-bottom:14px">✨ Ask anything about your shop</a>' : ''}
+    ${state.settings.ai_enabled ? '<a class="btn soft block small" href="#/assistant" style="margin-bottom:10px">✨ Ask anything about your shop</a>' : ''}
     <div class="card stat hero">
       <div class="label">Profit · ${esc(monthName(d.month))}</div>
       <div class="value num">${usd(d.profit)}</div>
@@ -414,29 +450,12 @@ async function pageHome() {
         <span>Pieces<b class="num">${d.pieces_sold}</b></span>
       </div>
     </div>
-    <p class="tiny muted" style="margin:8px 4px 0">Only Delivered or Paid orders count. Costs = real cost of pieces + delivery fees + other expenses.</p>
 
-    <div class="grid" style="margin-top:14px">
-      <a class="card stat" href="#/orders?f=owed">
-        <div class="label">Drivers owe you</div>
-        <div class="value num ${d.cod_owed.amount > 0 ? 'bad' : ''}">${usd0(d.cod_owed.amount)}</div>
-        <div class="sub">${d.cod_owed.orders} order${d.cod_owed.orders === 1 ? '' : 's'} delivered, not paid</div>
-      </a>
-      <a class="card stat" href="#/orders?f=open">
-        <div class="label">Open orders</div>
-        <div class="value num">${d.open_orders.orders}</div>
-        <div class="sub">${usd0(d.open_orders.amount)} not delivered yet</div>
-      </a>
-      <a class="card stat" href="#/stock">
-        <div class="label">Stock on hand</div>
-        <div class="value num">${d.stock.pieces} pcs</div>
-        <div class="sub">Worth ${usd0(d.stock.value)} at cost</div>
-      </a>
-      <a class="card stat" href="#/shipments">
-        <div class="label">Spent on stock</div>
-        <div class="value num">${usd0(d.stock_bought)}</div>
-        <div class="sub">This month, incl. shipping</div>
-      </a>
+    <div class="card kv" style="margin-top:10px">
+      <a href="#/orders?f=owed"><span>Drivers owe you <small>${d.cod_owed.orders} delivered, not paid</small></span><b class="num ${d.cod_owed.amount > 0 ? 'bad' : ''}">${usd0(d.cod_owed.amount)}</b></a>
+      <a href="#/orders?f=open"><span>Open orders <small>${usd0(d.open_orders.amount)} not delivered yet</small></span><b class="num">${d.open_orders.orders}</b></a>
+      <a href="#/stock"><span>Stock on hand <small>Worth ${usd0(d.stock.value)} at cost</small></span><b class="num">${d.stock.pieces} pcs</b></a>
+      <a href="#/shipments"><span>Spent on stock <small>This month, incl. shipping</small></span><b class="num">${usd0(d.stock_bought)}</b></a>
     </div>
 
     <h2>Last 6 months</h2>
@@ -448,7 +467,6 @@ async function pageHome() {
           <span class="m">${esc(monthShort(t.month))}</span>
         </div>`).join('')}
       </div>
-      <p class="tiny muted" style="margin:10px 0 0">Profit per month. Red means a loss.</p>
     </div>
 
     <h2 class="section-link">Best sellers <a href="#/report?m=${esc(d.month)}">Monthly report ›</a></h2>
@@ -551,10 +569,10 @@ async function setupInsights() {
     <div class="ins-totals" style="margin-top:12px">
       <div class="card stat"><div class="label">Pieces sold</div><div class="value num">${t.pieces}</div><div class="sub">${t.orders} order${t.orders === 1 ? '' : 's'}</div></div>
       <div class="card stat"><div class="label">Sales</div><div class="value num">${usd0(t.sales)}</div></div>
-      <div class="card stat"><div class="label">Profit</div><div class="value num ${t.profit < 0 ? 'bad' : 'good'}">${usd0(t.profit)}</div></div>
+      <div class="card stat"><div class="label">Profit*</div><div class="value num ${t.profit < 0 ? 'bad' : 'good'}">${usd0(t.profit)}</div></div>
     </div>
-    <p class="tiny muted" style="margin:6px 4px 0">Profit here = selling price − real cost of the pieces, before delivery fees and expenses.</p>
-    <div class="card" style="margin-top:12px"><h3>Over time</h3>${timeChart(r.over_time, r.bucket)}</div>
+    <p class="tiny muted" style="margin:4px 2px 0">*Price − real cost of pieces, before delivery & expenses.</p>
+    <div class="card" style="margin-top:10px"><h3>Over time</h3>${timeChart(r.over_time, r.bucket)}</div>
     ${ins.style ? '' : `<div class="card" style="margin-top:12px"><h3>Best styles</h3>${hbarChart(r.by_style, { photos: true, empty: 'No sales in this period.' })}</div>`}
     <div class="ins-pair" style="margin-top:12px">
       <div class="card"><h3>Best colors</h3>${hbarChart(r.by_color)}</div>
@@ -922,17 +940,15 @@ async function pageStock() {
     $('#list').innerHTML = `<p class="small muted">${pieces} pieces in ${styles.length} style${styles.length === 1 ? '' : 's'}. Tap a number to edit it.</p>` + styles.map((s) => `
       <div class="card" style="margin-top:12px">
         <div class="row top">
-          <button type="button" class="link" data-photo="${esc(s.style)}" style="padding:0" aria-label="Photo for ${esc(s.style)}">${photoTag(s.photo, 'lg')}</button>
+          <button type="button" class="link" data-photo="${esc(s.style)}" style="padding:0" aria-label="Photo for ${esc(s.style)}">${photoTag(s.photo)}</button>
           <div class="grow">
             <div class="row between top">
-              <h3 class="serif" style="font-size:19px;font-weight:600">${esc(s.style)}</h3>
+              <h3 class="serif" style="font-size:17px;font-weight:600">${esc(s.style)}</h3>
               <button type="button" class="small" data-edit-style="${esc(s.style)}">Edit</button>
             </div>
-            <div class="small muted" style="margin-top:2px">
-              ${s.code ? `<span class="pill code">${esc(s.code)}</span> ` : ''}
-              Sell ${usd(s.price)}${s.min ? ` · min ${usd(s.min)}` : ''} · cost ${usd(s.cost)}
+            <div class="small muted" style="margin-top:1px">
+              <b style="color:var(--ink)">${s.pieces} pcs</b> · sell ${usd0(s.price)}${s.min ? ` (min ${usd0(s.min)})` : ''} · cost ${usd(s.cost)}${s.code ? ` · <span class="pill code">${esc(s.code)}</span>` : ''}
             </div>
-            <div class="small" style="margin-top:2px"><b>${s.pieces}</b> pcs left</div>
           </div>
         </div>
         ${matrixHtml(s.list)}
@@ -1843,11 +1859,8 @@ async function pageSettings() {
       </div>
     </div>
 
-    <h2>Put it on your phone</h2>
-    <div class="card small">
-      <strong>iPhone:</strong> open in Safari → Share → <em>Add to Home Screen</em>.<br>
-      <strong>Android:</strong> open in Chrome → ⋮ menu → <em>Add to Home screen</em>.
-    </div>
+    <h2>Install on your phone</h2>
+    <div class="card small">${isInstalled() ? '✅ Installed. You are using the app.' : `${installBtn('primary block')}<p class="tiny muted" style="margin:8px 0 0">Adds She Sleepwear to your home screen.</p>`}</div>
 
     <div class="actions"><button class="danger" id="logout">Log out</button></div>`;
 
