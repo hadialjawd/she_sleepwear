@@ -1823,10 +1823,18 @@ async function pageSettings() {
       <div class="actions"><button class="primary" id="saveWa">Save message</button></div>
     </form>
 
-    <h2>AI reading</h2>
-    <div class="card small">${st.ai_enabled
-      ? '<span class="pill paid">On</span> Scan receipts and notebook pages from <b>+ → New shipment</b> or <b>New expense</b>.'
-      : '<span class="pill">Off</span> AI reading needs a free Gemini key. Ask the person who set up the app.'}</div>
+    <h2>AI (scanning & assistant)</h2>
+    <div class="card small">
+      ${st.ai_enabled ? '<span class="pill paid">On</span> Scan receipts and notebook pages, and use the assistant.' : '<span class="pill">Off</span> Needs a free Gemini key.'}
+      ${st.ai_key?.source === 'app' ? `<div class="muted tiny" style="margin-top:4px">Using your key ending in <b>…${esc(st.ai_key.hint)}</b></div>` : ''}
+      ${isOwner ? `
+      <form id="aiF" style="margin-top:6px">
+        <label for="aiKey">${st.ai_key?.source === 'app' ? 'Replace AI key' : 'Your Gemini AI key'}</label>
+        <input id="aiKey" name="key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Paste the key here">
+        <div class="hint">Free from <b>aistudio.google.com/apikey</b> → Create API key. No card needed; don't set up billing.</div>
+        <div class="actions"><button class="primary" id="saveAi">Save key</button>${st.ai_key?.source === 'app' ? '<button type="button" class="danger" id="delAi">Remove key</button>' : ''}</div>
+      </form>` : '<div class="tiny muted" style="margin-top:4px">Only the owner can change the AI key.</div>'}
+    </div>
 
     <h2>Who can get in</h2>
     <div class="card">
@@ -1872,6 +1880,26 @@ async function pageSettings() {
     await saveSettings({ lbp_rate: Number(rf.rate.value) });
     toast('Rate saved');
   }));
+  if (isOwner) {
+    const af = $('#aiF');
+    af.addEventListener('submit', busy($('#saveAi'), async () => {
+      if (!af.key.value.trim()) throw new Error('Paste the key first');
+      $('#saveAi').innerHTML = '<span class="spinner"></span> Checking…';
+      try {
+        await saveSettings({ gemini_api_key: af.key.value.trim() });
+      } finally {
+        $('#saveAi').textContent = 'Save key';
+      }
+      toast('AI key saved. AI is on.');
+      refresh('#/settings', pageSettings);
+    }));
+    $('#delAi')?.addEventListener('click', busy($('#delAi'), async () => {
+      if (!confirm('Remove the AI key? Scanning and the assistant will stop working.')) return;
+      await saveSettings({ gemini_api_key: '' });
+      toast('AI key removed');
+      refresh('#/settings', pageSettings);
+    }));
+  }
   const wf = $('#waF');
   wf.addEventListener('submit', busy($('#saveWa'), async () => {
     await saveSettings({ wa_confirm: wf.wa.value });
