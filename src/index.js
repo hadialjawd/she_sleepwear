@@ -183,7 +183,7 @@ async function handleApi(request, env, url) {
 
   switch (resource) {
     case 'users': return users(request, env, method, id, user);
-    case 'settings': return settings(request, env, method);
+    case 'settings': return settings(request, env, method, user);
     case 'products': return products(request, env, method, id);
     case 'styles': return styles(request, env, method);
     case 'style-photos': return stylePhotos(request, env, method, id);
@@ -235,9 +235,31 @@ async function users(request, env, method, id, me) {
   throw new HttpError(405, 'Method not allowed');
 }
 
-async function settings(request, env, method) {
+// The shop's own Gemini key (saved in Settings) wins over the Cloudflare secret
+async function geminiKey(env) {
+  const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'gemini_api_key'").first();
+  return (row && row.value) || env.GEMINI_API_KEY || '';
+}
+
+async function checkGeminiKey(key) {
+  const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=1', { headers: { 'x-goog-api-key': key } });
+  if (res.status === 400 || res.status === 401 || res.status === 403) throw new HttpError(400, 'This key does not work. Copy it again from aistudio.google.com/apikey');
+  if (!res.ok) throw new HttpError(502, 'Could not check the key with Google. Try again in a moment.');
+}
+
+async function settings(request, env, method, user) {
   if (method === 'PUT') {
     const b = await body(request);
+    if (b.gemini_api_key !== undefined) {
+      if (user.role !== 'owner') throw new HttpError(403, 'Only the owner can change the AI key');
+      const key = str(b.gemini_api_key, 200);
+      if (key) {
+        await checkGeminiKey(key);
+        await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('gemini_api_key', ?)").bind(key).run();
+      } else {
+        await env.DB.prepare("DELETE FROM settings WHERE key = 'gemini_api_key'").run();
+      }
+    }
     const set = (key, value) => env.DB.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').bind(key, String(value));
     const stmts = [];
     if (b.lbp_rate !== undefined) {
@@ -262,7 +284,9 @@ async function settings(request, env, method) {
     default_delivery_fee: num(s.default_delivery_fee, 0),
     wa_confirm: s.wa_confirm ?? '',
     wa_sent: s.wa_sent ?? '',
-    ai_enabled: !!env.GEMINI_API_KEY,
+    ai_enabled: !!(s.gemini_api_key || env.GEMINI_API_KEY),
+    // Never send the key itself, only where it comes from and its last 4 characters
+    ai_key: s.gemini_api_key ? { source: 'app', hint: s.gemini_api_key.slice(-4) } : env.GEMINI_API_KEY ? { source: 'server' } : null,
   });
 }
 
@@ -936,7 +960,8 @@ function cleanAiResult(kind, r) {
 
 async function aiRead(request, env, method, action) {
   if (method !== 'POST' || action !== 'read') throw new HttpError(404, 'Not found');
-  if (!env.GEMINI_API_KEY) throw new HttpError(400, 'AI reading is not set up yet');
+  const apiKey = await geminiKey(env);
+  if (!apiKey) throw new HttpError(400, 'AI reading is not set up yet. The owner can add a key in Settings.');
   const form = await request.formData();
   const kind = form.get('kind');
   if (!AI_SCHEMAS[kind]) throw new HttpError(400, 'Unknown kind');
@@ -953,7 +978,7 @@ async function aiRead(request, env, method, action) {
   });
   const ask = (model) => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
+    headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey },
     body: payload,
   });
   let res = await ask(env.GEMINI_MODEL || 'gemini-3-flash-preview');
@@ -1090,7 +1115,8 @@ function cleanOrderDraft(o, products) {
 
 async function assistant(request, env, method) {
   if (method !== 'POST') throw new HttpError(405, 'Method not allowed');
-  if (!env.GEMINI_API_KEY) throw new HttpError(400, 'AI is not set up yet');
+  const apiKey = await geminiKey(env);
+  if (!apiKey) throw new HttpError(400, 'AI is not set up yet. The owner can add a key in Settings.');
   const form = await request.formData();
   let history = [];
   try {
@@ -1124,7 +1150,7 @@ async function assistant(request, env, method) {
   });
   const ask = (model) => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
+    headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey },
     body: payload,
   });
   let res = await ask(env.GEMINI_MODEL || 'gemini-3-flash-preview');
